@@ -23,7 +23,7 @@
  *     scripted mode.
  *   - getUserMedia denied → mic visualizer stays at 0 but interview still works.
  */
-import { useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Mic } from "lucide-react";
 import { toast } from "sonner";
@@ -40,15 +40,29 @@ import { Track, type Track as TrackNS } from "livekit-client";
 import type { Job } from "@/lib/types";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { tween, DUR, EASE_OUT } from "@/components/motion";
+import {
+  useDeepgramTranscription,
+  type TranscriptFragment,
+} from "@/lib/hooks/use-deepgram-transcription";
 
 const DURATION_MS = 120_000;
 
+// Background-themed scripted questions for the 2-minute demo. Each is short
+// enough that Cartesia takes about 8–10 seconds of audio.
 const FALLBACK_QUESTIONS = [
-  "Hi — thanks for taking the time. Tell me about yourself in sixty seconds.",
-  "Walk me through the last project you shipped — what made it hard?",
-  "Tell me about a time you had to push back against engineering. What did you do?",
-  "Why this role, specifically?",
+  "Hi — thanks for taking the time. To start, tell me about yourself in sixty seconds.",
+  "Walk me through your background — your school, your work so far, and what you've shipped.",
+  "What technologies are you strongest in, and why did you gravitate toward them?",
+  "Last one: why are you looking for a new role right now?",
 ];
+
+// After the final question's audio ends, give the candidate this much time to
+// answer before the interview auto-ends and routes to the report.
+const FINAL_ANSWER_WINDOW_MS = 20_000;
+// During earlier questions, we also wait this long for the candidate to
+// answer before kicking off the next question. Slightly tighter than the
+// final-window so the interview doesn't drag.
+const ANSWER_WINDOW_MS = 14_000;
 
 interface TranscriptTurn {
   id: string;
@@ -376,6 +390,8 @@ function ScriptedFallback({
   const [questionIndex, setQuestionIndex] = useState(0);
   const [agentState, setAgentState] = useState<"connecting" | "speaking" | "listening">("connecting");
   const [transcript, setTranscript] = useState<TranscriptTurn[]>([]);
+  // Live (interim) candidate fragment — re-rendered as Deepgram emits partials.
+  const [liveCandidate, setLiveCandidate] = useState<string>("");
   const [showTranscript, setShowTranscript] = useState(true);
   const [localVolume, setLocalVolume] = useState(0);
   const [agentVolume, setAgentVolume] = useState(0);
@@ -384,7 +400,13 @@ function ScriptedFallback({
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const endedRef = useRef(false);
+  // Tracks the index of the currently-active question so Deepgram finals can
+  // be attributed to the correct turn.
+  const activeQuestionRef = useRef(-1);
 
+  // Mic-amplitude analyser for the bottom waveform. The Deepgram hook owns its
+  // own mic stream — using two getUserMedia calls is fine on Chrome.
   useEffect(() => {
     let cancelled = false;
     let stream: MediaStream | null = null;
@@ -421,6 +443,41 @@ function ScriptedFallback({
     };
   }, []);
 
+  // Stable callbacks for the Deepgram hook so renders don't recycle the WS.
+  const handleFinal = useCallback((frag: TranscriptFragment) => {
+    const t = Math.floor((Date.now() - startedRef.current) / 1000);
+    const qIdx = activeQuestionRef.current;
+    setLiveCandidate("");
+    setTranscript((prev) => [
+      ...prev,
+      {
+        id: `c-${qIdx}-${frag.id}`,
+        role: "candidate",
+        text: frag.text,
+        t,
+        final: true,
+      },
+    ]);
+  }, []);
+  const handleInterim = useCallback((frag: TranscriptFragment) => {
+    setLiveCandidate(frag.text);
+  }, []);
+
+  // Open the Deepgram WS as soon as the fallback mounts. The hook handles its
+  // own getUserMedia and survives the entire interview.
+  const dg = useDeepgramTranscription({
+    enabled: true,
+    onFinal: handleFinal,
+    onInterim: handleInterim,
+  });
+  // Surface a one-time toast if Deepgram errored — the demo still works
+  // without transcription.
+  useEffect(() => {
+    if (dg.error) {
+      toast.error(`Live transcription unavailable: ${dg.error}`);
+    }
+  }, [dg.error]);
+
   useEffect(() => {
     let cancelled = false;
     function commitInterviewerTurn(text: string, i: number) {
@@ -430,24 +487,20 @@ function ScriptedFallback({
         return [...prev, { id: `q-${i}`, role: "interviewer", text, t, final: true }];
       });
       setQuestionIndex(i + 1);
+      activeQuestionRef.current = i;
     }
     function scheduleNext(i: number, ms: number) {
       if (cancelled) return;
       setTimeout(() => {
         if (cancelled) return;
-        const t = Math.floor((Date.now() - startedRef.current) / 1000);
-        setTranscript((prev) => [
-          ...prev,
-          {
-            id: `c-${i}`,
-            role: "candidate",
-            text: "[Your answer is being captured…]",
-            t: Math.max(0, t - 6),
-            final: true,
-          },
-        ]);
-      }, 1500);
-      setTimeout(() => playQuestion(i + 1), ms);
+        // Q4 is the last — after the answer window, end the interview rather
+        // than queuing another question.
+        if (i + 1 >= FALLBACK_QUESTIONS.length) {
+          endInterview();
+        } else {
+          playQuestion(i + 1);
+        }
+      }, ms);
     }
     async function playQuestion(i: number) {
       if (cancelled || i >= FALLBACK_QUESTIONS.length) return;
@@ -460,7 +513,8 @@ function ScriptedFallback({
         });
         if (!res.ok) {
           commitInterviewerTurn(FALLBACK_QUESTIONS[i]!, i);
-          scheduleNext(i, 6000);
+          const wait = i + 1 >= FALLBACK_QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
+          scheduleNext(i, wait);
           return;
         }
         const blob = await res.blob();
@@ -493,7 +547,8 @@ function ScriptedFallback({
             cancelAnimationFrame(raf);
             setAgentVolume(0);
             setAgentState("listening");
-            scheduleNext(i, 10000);
+            const wait = i + 1 >= FALLBACK_QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
+            scheduleNext(i, wait);
           });
         } catch {
           audio.addEventListener("play", () => {
@@ -502,13 +557,15 @@ function ScriptedFallback({
           });
           audio.addEventListener("ended", () => {
             setAgentState("listening");
-            scheduleNext(i, 10000);
+            const wait = i + 1 >= FALLBACK_QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
+            scheduleNext(i, wait);
           });
         }
         await audio.play();
       } catch {
         commitInterviewerTurn(FALLBACK_QUESTIONS[i]!, i);
-        scheduleNext(i, 6000);
+        const wait = i + 1 >= FALLBACK_QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
+        scheduleNext(i, wait);
       }
     }
     const kickoff = setTimeout(() => playQuestion(0), 600);
@@ -534,7 +591,8 @@ function ScriptedFallback({
   }, []);
 
   function endInterview() {
-    if (ending || showIngestion) return;
+    if (endedRef.current || ending || showIngestion) return;
+    endedRef.current = true;
     setShowIngestion(true);
     audioRef.current?.pause();
     startEnd(async () => {
@@ -554,6 +612,7 @@ function ScriptedFallback({
       } catch {
         toast.error("Could not finalize report");
         setShowIngestion(false);
+        endedRef.current = false;
       }
     });
   }
@@ -607,7 +666,9 @@ function ScriptedFallback({
         onToggleTranscript={() => setShowTranscript((v) => !v)}
         onEnd={endInterview}
       />
-      {showTranscript && <FloatingTranscript turns={transcript} voice={voice} />}
+      {showTranscript && (
+        <FloatingTranscript turns={transcript} voice={voice} liveCandidate={liveCandidate} />
+      )}
       <AnimatePresence>{showIngestion && <IngestionOverlay />}</AnimatePresence>
     </CallShell>
   );
@@ -935,12 +996,20 @@ function MicWaveform({ volume }: { volume: number }) {
   );
 }
 
-function FloatingTranscript({ turns, voice }: { turns: TranscriptTurn[]; voice: string }) {
+function FloatingTranscript({
+  turns,
+  voice,
+  liveCandidate,
+}: {
+  turns: TranscriptTurn[];
+  voice: string;
+  liveCandidate?: string;
+}) {
   const scrollerRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const el = scrollerRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [turns.length]);
+  }, [turns.length, liveCandidate]);
   return (
     <div
       ref={scrollerRef}
@@ -948,7 +1017,7 @@ function FloatingTranscript({ turns, voice }: { turns: TranscriptTurn[]; voice: 
         position: "absolute",
         left: 32,
         top: 100,
-        width: 320,
+        width: 340,
         background: "#1c1a1480",
         backdropFilter: "blur(20px)",
         WebkitBackdropFilter: "blur(20px)",
@@ -958,55 +1027,105 @@ function FloatingTranscript({ turns, voice }: { turns: TranscriptTurn[]; voice: 
         display: "flex",
         flexDirection: "column",
         gap: 10,
-        maxHeight: 380,
+        maxHeight: 420,
         overflowY: "auto",
         zIndex: 3,
       }}
     >
       <Eyebrow style={{ color: "#74706a" }}>Live transcript</Eyebrow>
       <div style={{ display: "flex", flexDirection: "column", gap: 10, fontSize: 13, lineHeight: 1.55 }}>
-        {turns.length === 0 && (
+        {turns.length === 0 && !liveCandidate && (
           <span style={{ color: "#74706a", fontStyle: "italic" }}>Waiting for the first turn…</span>
         )}
-        {turns.map((t) => {
-          const isInt = t.role === "interviewer";
-          return (
-            <motion.div
-              key={t.id}
-              initial={{ opacity: 0, y: 4 }}
-              animate={{ opacity: t.final ? 1 : 0.7, y: 0 }}
-              transition={tween(DUR.slow, EASE_OUT)}
-            >
-              <span
-                className="mono"
-                style={{
-                  fontSize: 10,
-                  color: isInt ? "#d97a4a" : "#a8a397",
-                  textTransform: "uppercase",
-                  letterSpacing: "0.12em",
-                }}
+        <AnimatePresence initial={false}>
+          {turns.map((t) => {
+            const isInt = t.role === "interviewer";
+            return (
+              <motion.div
+                key={t.id}
+                layout
+                initial={{ opacity: 0, y: 6 }}
+                animate={{ opacity: t.final ? 1 : 0.7, y: 0 }}
+                exit={{ opacity: 0 }}
+                transition={tween(DUR.slow, EASE_OUT)}
               >
-                {isInt ? voice : "You"} · {Math.floor(t.t / 60)}:
-                {String(t.t % 60).padStart(2, "0")}
-              </span>
-              <p style={{ margin: "2px 0 0", color: isInt ? "#d8d3c5" : "#ece7dc" }}>
-                {t.text}
-                {!t.final && (
-                  <span
-                    style={{
-                      background: "#fff2",
-                      color: "#fff",
-                      padding: "0 2px",
-                      marginLeft: 4,
-                    }}
-                  >
-                    …
-                  </span>
+                <span
+                  className="mono"
+                  style={{
+                    fontSize: 10,
+                    color: isInt ? "#d97a4a" : "#a8a397",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.12em",
+                  }}
+                >
+                  {isInt ? voice : "You"} · {Math.floor(t.t / 60)}:
+                  {String(t.t % 60).padStart(2, "0")}
+                </span>
+                {isInt ? (
+                  <p style={{ margin: "2px 0 0", color: "#d8d3c5" }}>{t.text}</p>
+                ) : (
+                  // Candidate finals: word-by-word fade so each word lands cleanly.
+                  <p style={{ margin: "2px 0 0", color: "#ece7dc" }}>
+                    {t.text.split(/\s+/).map((w, i) => (
+                      <motion.span
+                        key={`${t.id}-${i}`}
+                        initial={{ opacity: 0, y: 2 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: i * 0.018, duration: 0.18, ease: "easeOut" }}
+                        style={{ display: "inline-block", marginRight: "0.28em" }}
+                      >
+                        {w}
+                      </motion.span>
+                    ))}
+                  </p>
                 )}
-              </p>
-            </motion.div>
-          );
-        })}
+              </motion.div>
+            );
+          })}
+        </AnimatePresence>
+        {liveCandidate && (
+          <motion.div
+            layout
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={tween(DUR.fast, EASE_OUT)}
+          >
+            <span
+              className="mono"
+              style={{
+                fontSize: 10,
+                color: "#a8a397",
+                textTransform: "uppercase",
+                letterSpacing: "0.12em",
+              }}
+            >
+              You · live
+            </span>
+            <p
+              style={{
+                margin: "2px 0 0",
+                color: "#ece7dc",
+                opacity: 0.7,
+                fontStyle: "italic",
+              }}
+            >
+              {liveCandidate}
+              <motion.span
+                aria-hidden="true"
+                animate={{ opacity: [0.3, 1, 0.3] }}
+                transition={{ duration: 1.2, repeat: Infinity }}
+                style={{
+                  display: "inline-block",
+                  marginLeft: 3,
+                  width: 6,
+                  height: 12,
+                  background: "#d97a4a",
+                  verticalAlign: "middle",
+                }}
+              />
+            </p>
+          </motion.div>
+        )}
       </div>
     </div>
   );
