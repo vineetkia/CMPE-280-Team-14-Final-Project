@@ -1,0 +1,183 @@
+# Hyrd · local stack
+#
+# Brings up the full app with one command:
+#   docker compose up
+#
+# Services:
+#   postgres   -> Postgres 16 with the Hyrd schema applied at first boot
+#   gotrue     -> Supabase-compatible auth (JWT, email+password)
+#   postgrest  -> Supabase-compatible REST + RLS data API
+#   meta       -> Storage stub (résumé files persist as Postgres bytea via /api/storage)
+#   web        -> Next.js 15 app
+#   agent      -> Python LiveKit voice interviewer (only runs if LIVEKIT_* env is set)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: hyrd-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: hyrd
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hyrd"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  gotrue:
+    image: supabase/gotrue:v2.158.1
+    container_name: hyrd-gotrue
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${GOTRUE_PORT:-9999}:9999"
+    environment:
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_API_PORT: 9999
+      API_EXTERNAL_URL: http://localhost:${GOTRUE_PORT:-9999}
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: postgres://supabase_auth_admin:${POSTGRES_PASSWORD:-postgres}@postgres:5432/hyrd?search_path=auth
+      GOTRUE_SITE_URL: http://localhost:${WEB_PORT:-3000}
+      GOTRUE_URI_ALLOW_LIST: "*"
+      GOTRUE_DISABLE_SIGNUP: "false"
+      GOTRUE_JWT_SECRET: ${JWT_SECRET:-super-secret-jwt-key-at-least-32-characters-long-please}
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_ADMIN_ROLES: service_role
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_MAILER_AUTOCONFIRM: "true"
+      GOTRUE_SMTP_ADMIN_EMAIL: admin@hyrd.local
+      GOTRUE_SMTP_HOST: localhost
+      GOTRUE_SMTP_PORT: 587
+      GOTRUE_SMTP_USER: ""
+      GOTRUE_SMTP_PASS: ""
+      GOTRUE_SMTP_SENDER_NAME: Hyrd
+
+  postgrest:
+    image: postgrest/postgrest:v12.2.3
+    container_name: hyrd-postgrest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${POSTGREST_PORT:-3001}:3000"
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD:-postgres}@postgres:5432/hyrd
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET:-super-secret-jwt-key-at-least-32-characters-long-please}
+      PGRST_JWT_AUD: authenticated
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_EXP: "3600"
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      target: ${WEB_TARGET:-runner}
+    container_name: hyrd-web
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      gotrue:
+        condition: service_started
+      postgrest:
+        condition: service_started
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    environment:
+      # Local stack endpoints — the Supabase JS client speaks both PostgREST and GoTrue.
+      NEXT_PUBLIC_SUPABASE_URL: http://localhost:${KONG_PORT:-8000}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+      SUPABASE_URL_INTERNAL: http://kong:8000
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/hyrd
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-}
+      NEXT_PUBLIC_LIVEKIT_URL: ${NEXT_PUBLIC_LIVEKIT_URL:-}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      CARTESIA_API_KEY: ${CARTESIA_API_KEY:-}
+      LOGODEV_API_KEY: ${LOGODEV_API_KEY:-}
+      INTERVIEW_AGENT: ${INTERVIEW_AGENT:-livekit}
+      # Azure AI Foundry (Azure OpenAI v1)
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-}
+      OPENAI_SURVEY_MODEL: ${OPENAI_SURVEY_MODEL:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+
+  kong:
+    # API gateway — fronts gotrue + postgrest on a single port, mimicking Supabase Cloud's surface.
+    image: kong:3.7
+    container_name: hyrd-kong
+    restart: unless-stopped
+    depends_on:
+      - gotrue
+      - postgrest
+    ports:
+      - "${KONG_PORT:-8000}:8000"
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /etc/kong/kong.yml
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_PLUGINS: request-transformer,cors,key-auth
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+    volumes:
+      - ./infra/kong.yml:/etc/kong/kong.yml:ro
+
+  seed:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      target: dev
+    container_name: hyrd-seed
+    profiles: ["seed"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      gotrue:
+        condition: service_started
+      kong:
+        condition: service_started
+    environment:
+      NEXT_PUBLIC_SUPABASE_URL: http://kong:8000
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+    command: ["npx", "tsx", "db/seed.ts"]
+
+  agent:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    container_name: hyrd-agent
+    restart: unless-stopped
+    profiles: ["voice"]   # only spin up when running `docker compose --profile voice up`
+    environment:
+      LIVEKIT_URL: ${NEXT_PUBLIC_LIVEKIT_URL:-}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      CARTESIA_API_KEY: ${CARTESIA_API_KEY:-}
+      # Agent's LLM — pointed at Azure AI Foundry v1 surface via the openai plugin.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_SURVEY_MODEL: ${OPENAI_SURVEY_MODEL:-}
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_SERVICE_ROLE_KEY: ${SERVICE_ROLE_KEY}
+
+volumes:
+  postgres-data:

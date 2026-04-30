@@ -1,0 +1,25 @@
+services:
+  - type: worker
+    name: hyrd-interviewer-agent
+    env: docker
+    plan: starter
+    region: oregon
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: DEEPGRAM_API_KEY
+        sync: false
+      - key: CARTESIA_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
