@@ -1,0 +1,215 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" width="1200" height="760" font-family="-apple-system, BlinkMacSystemFont, 'Inter Tight', system-ui, sans-serif">
+  <style>
+    .bg { fill: #f4f1ea; }
+    .paper { fill: #fbf8f1; stroke: #15140f1a; stroke-width: 1; }
+    .ink { fill: #15140f; }
+    .ink-2 { fill: #2a2722; }
+    .ink-3 { fill: #555048; }
+    .ink-4 { fill: #8a857a; }
+    .accent { fill: #9c4a2c; }
+    .positive { fill: #3f5c3a; }
+    .info { fill: #3a4f6e; }
+    .hairline { stroke: #15140f1a; stroke-width: 1; }
+    .hairline-strong { stroke: #15140f33; stroke-width: 1; }
+    .ink-stroke { stroke: #15140f; stroke-width: 1; }
+    .accent-stroke { stroke: #9c4a2c; stroke-width: 1.25; }
+    .info-stroke { stroke: #3a4f6e; stroke-width: 1.25; }
+    .positive-stroke { stroke: #3f5c3a; stroke-width: 1.25; }
+    .serif { font-family: 'Fraunces', Georgia, serif; }
+    .mono { font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace; }
+    .eyebrow { font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; fill: #8a857a; }
+    .label { font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace; font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase; fill: #555048; }
+    .title { font-family: 'Fraunces', Georgia, serif; font-size: 16px; font-weight: 500; letter-spacing: -0.015em; fill: #15140f; }
+    .body { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; font-size: 11px; fill: #2a2722; }
+    .num { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10px; letter-spacing: 0.16em; fill: #8a857a; }
+  </style>
+
+  <rect width="1200" height="760" class="bg"/>
+
+  <!-- Title -->
+  <text x="40" y="44" class="eyebrow">№ Architecture · Hyrd platform</text>
+  <text x="40" y="86" class="serif" font-size="36" font-weight="400" letter-spacing="-0.025em" fill="#15140f">
+    Six services, <tspan font-style="italic" fill="#9c4a2c">one stack</tspan>.
+  </text>
+  <line x1="40" y1="108" x2="1160" y2="108" class="ink-stroke"/>
+
+  <!-- ───────── BROWSER ───────── -->
+  <g>
+    <rect x="40" y="140" width="200" height="84" rx="14" class="paper"/>
+    <text x="56" y="166" class="num">CLIENT</text>
+    <text x="56" y="190" class="title">Browser</text>
+    <text x="56" y="208" class="body" fill="#555048">Next.js 15 · React 18 · dnd-kit</text>
+  </g>
+
+  <!-- arrow client -> kong -->
+  <line x1="240" y1="182" x2="320" y2="182" class="hairline-strong"/>
+  <polygon points="320,182 312,178 312,186" fill="#15140f33"/>
+  <text x="248" y="174" class="label">https</text>
+
+  <!-- ───────── KONG ───────── -->
+  <g>
+    <rect x="320" y="140" width="200" height="84" rx="14" class="paper"/>
+    <text x="336" y="166" class="num">№ 01 · GATEWAY</text>
+    <text x="336" y="190" class="title">Kong 3.7</text>
+    <text x="336" y="208" class="body" fill="#555048">/auth/v1 · /rest/v1 routing</text>
+  </g>
+
+  <!-- two arrows kong -> gotrue + postgrest -->
+  <path d="M 520 174 Q 580 174 600 200" fill="none" class="hairline-strong"/>
+  <polygon points="600,200 591,196 597,189" fill="#15140f33"/>
+  <path d="M 520 192 Q 580 192 600 280" fill="none" class="hairline-strong"/>
+  <polygon points="600,280 593,272 599,272" fill="#15140f33"/>
+
+  <!-- ───────── GOTRUE ───────── -->
+  <g>
+    <rect x="600" y="140" width="200" height="84" rx="14" class="paper"/>
+    <text x="616" y="166" class="num">№ 02 · AUTH</text>
+    <text x="616" y="190" class="title">GoTrue</text>
+    <text x="616" y="208" class="body" fill="#555048">JWT · email + password</text>
+  </g>
+
+  <!-- ───────── POSTGREST ───────── -->
+  <g>
+    <rect x="600" y="240" width="200" height="84" rx="14" class="paper"/>
+    <text x="616" y="266" class="num">№ 03 · DATA API</text>
+    <text x="616" y="290" class="title">PostgREST</text>
+    <text x="616" y="308" class="body" fill="#555048">RLS-scoped REST · v1 spec</text>
+  </g>
+
+  <!-- arrows gotrue + postgrest -> postgres -->
+  <path d="M 800 182 Q 870 182 880 234" fill="none" class="hairline-strong"/>
+  <polygon points="880,234 873,225 880,224" fill="#15140f33"/>
+  <line x1="800" y1="282" x2="880" y2="282" class="hairline-strong"/>
+  <polygon points="880,282 872,278 872,286" fill="#15140f33"/>
+
+  <!-- ───────── POSTGRES ───────── -->
+  <g>
+    <rect x="880" y="240" width="200" height="84" rx="14" class="paper"/>
+    <text x="896" y="266" class="num">№ 04 · DATABASE</text>
+    <text x="896" y="290" class="title">Postgres 16</text>
+    <text x="896" y="308" class="body" fill="#555048">5 tables · RLS · auth schema</text>
+  </g>
+
+  <!-- ───────── WEB (Next.js server) ───────── -->
+  <line x1="140" y1="224" x2="140" y2="380" class="hairline-strong" stroke-dasharray="2 3"/>
+  <text x="148" y="300" class="label" transform="rotate(0 148 300)">SSR fetch</text>
+
+  <g>
+    <rect x="40" y="380" width="280" height="120" rx="14" class="paper"/>
+    <text x="56" y="406" class="num">№ 05 · APPLICATION</text>
+    <text x="56" y="432" class="title">Next.js 15 server (web)</text>
+    <line x1="56" y1="446" x2="304" y2="446" class="hairline"/>
+    <text x="56" y="464" class="body" fill="#2a2722">App Router · Server Actions</text>
+    <text x="56" y="478" class="body" fill="#2a2722">/api/optimize-resume · /api/interview/*</text>
+    <text x="56" y="492" class="body" fill="#2a2722">/api/storage/upload · /api/parse-resume</text>
+  </g>
+
+  <!-- arrow web -> postgrest (downward right diagonal) -->
+  <path d="M 320 430 Q 530 430 600 282" fill="none" class="hairline-strong"/>
+  <polygon points="600,282 597,290 605,289" fill="#15140f33"/>
+  <text x="430" y="370" class="label">RLS data</text>
+
+  <!-- arrow web -> kong (auth) -->
+  <path d="M 250 380 Q 250 280 320 195" fill="none" class="hairline-strong"/>
+  <polygon points="320,195 312,196 315,203" fill="#15140f33"/>
+
+  <!-- ───────── LLM PROVIDER (Azure / Anthropic) ───────── -->
+  <g>
+    <rect x="380" y="380" width="320" height="120" rx="14" fill="#9c4a2c1f" stroke="#9c4a2c" stroke-width="1"/>
+    <text x="396" y="406" class="num" fill="#9c4a2c">№ 06 · LLM PROVIDER</text>
+    <text x="396" y="432" class="title">Azure AI Foundry</text>
+    <line x1="396" y1="446" x2="684" y2="446" stroke="#9c4a2c" stroke-width="1" opacity="0.3"/>
+    <text x="396" y="464" class="body" fill="#2a2722">truestar-gpt-5.3-chat · heavy tier</text>
+    <text x="396" y="478" class="body" fill="#2a2722">truestar-gpt-5.4-mini · light tier</text>
+    <text x="396" y="495" class="label" fill="#9c4a2c">LLM_PROVIDER=azure | anthropic (claude)</text>
+  </g>
+
+  <!-- arrow web -> azure -->
+  <path d="M 320 460 L 380 460" class="accent-stroke" fill="none"/>
+  <polygon points="380,460 372,456 372,464" fill="#9c4a2c"/>
+  <text x="328" y="452" class="label" fill="#9c4a2c">resume opt · feedback</text>
+
+  <!-- ───────── LIVEKIT CLOUD ───────── -->
+  <g>
+    <rect x="760" y="380" width="200" height="120" rx="14" fill="#3a4f6e1a" stroke="#3a4f6e" stroke-width="1"/>
+    <text x="776" y="406" class="num" fill="#3a4f6e">EXTERNAL · CLOUD</text>
+    <text x="776" y="432" class="title">LiveKit Cloud</text>
+    <line x1="776" y1="446" x2="944" y2="446" stroke="#3a4f6e" stroke-width="1" opacity="0.3"/>
+    <text x="776" y="464" class="body" fill="#2a2722">WebRTC SFU · room JWT</text>
+    <text x="776" y="478" class="body" fill="#2a2722">audio routing</text>
+    <text x="776" y="495" class="label" fill="#3a4f6e">us-west-b</text>
+  </g>
+
+  <!-- ───────── PYTHON AGENT ───────── -->
+  <g>
+    <rect x="40" y="540" width="280" height="120" rx="14" class="paper"/>
+    <text x="56" y="566" class="num">№ 07 · VOICE AGENT</text>
+    <text x="56" y="592" class="title">Python · livekit-agents 1.5</text>
+    <line x1="56" y1="606" x2="304" y2="606" class="hairline"/>
+    <text x="56" y="624" class="body" fill="#2a2722">Deepgram Nova-3 STT (streaming)</text>
+    <text x="56" y="638" class="body" fill="#2a2722">Claude Haiku 4.5 LLM</text>
+    <text x="56" y="652" class="body" fill="#2a2722">Cartesia Sonic-2 TTS (streaming)</text>
+  </g>
+
+  <!-- arrow agent -> livekit -->
+  <path d="M 320 600 Q 600 600 860 500" fill="none" class="info-stroke" stroke-dasharray="3 3"/>
+  <polygon points="860,500 853,508 859,510" fill="#3a4f6e"/>
+  <text x="500" y="595" class="label" fill="#3a4f6e">join interview rooms</text>
+
+  <!-- arrow browser -> livekit (WebRTC) -->
+  <path d="M 140 224 Q 140 280 760 410" fill="none" class="info-stroke" stroke-dasharray="3 3"/>
+  <polygon points="760,410 752,409 754,417" fill="#3a4f6e"/>
+  <text x="170" y="290" class="label" fill="#3a4f6e">browser webrtc</text>
+
+  <!-- arrow agent -> postgres (transcript flush) -->
+  <path d="M 320 660 Q 600 720 980 324" fill="none" class="positive-stroke" stroke-dasharray="3 3"/>
+  <polygon points="980,324 977,332 985,330" fill="#3f5c3a"/>
+  <text x="540" y="715" class="label" fill="#3f5c3a">end-of-call transcript flush · service-role</text>
+
+  <!-- ───────── EXTERNAL SPEECH ───────── -->
+  <g>
+    <rect x="380" y="540" width="180" height="120" rx="14" fill="#3a4f6e1a" stroke="#3a4f6e" stroke-width="1"/>
+    <text x="396" y="566" class="num" fill="#3a4f6e">EXTERNAL · STT</text>
+    <text x="396" y="592" class="title">Deepgram</text>
+    <text x="396" y="612" class="body" fill="#2a2722">Nova-3 streaming</text>
+  </g>
+
+  <g>
+    <rect x="580" y="540" width="180" height="120" rx="14" fill="#3a4f6e1a" stroke="#3a4f6e" stroke-width="1"/>
+    <text x="596" y="566" class="num" fill="#3a4f6e">EXTERNAL · TTS</text>
+    <text x="596" y="592" class="title">Cartesia</text>
+    <text x="596" y="612" class="body" fill="#2a2722">Sonic-2 streaming</text>
+  </g>
+
+  <g>
+    <rect x="780" y="540" width="180" height="120" rx="14" fill="#3a4f6e1a" stroke="#3a4f6e" stroke-width="1"/>
+    <text x="796" y="566" class="num" fill="#3a4f6e">EXTERNAL · LLM</text>
+    <text x="796" y="592" class="title">Anthropic</text>
+    <text x="796" y="612" class="body" fill="#2a2722">Claude Haiku 4.5 (agent)</text>
+  </g>
+
+  <!-- decorative serif numeral bottom right -->
+  <text x="1100" y="720" class="serif" font-style="italic" font-size="220" fill="#15140f08" letter-spacing="-0.05em" pointer-events="none">H</text>
+
+  <!-- Legend -->
+  <g transform="translate(980, 140)">
+    <text x="0" y="0" class="eyebrow">Legend</text>
+    <line x1="0" y1="14" x2="180" y2="14" class="hairline"/>
+
+    <line x1="0" y1="32" x2="20" y2="32" class="hairline-strong"/>
+    <polygon points="20,32 16,30 16,34" fill="#15140f33"/>
+    <text x="28" y="36" class="body" fill="#555048">internal HTTP/SQL</text>
+
+    <line x1="0" y1="52" x2="20" y2="52" class="accent-stroke"/>
+    <polygon points="20,52 16,50 16,54" fill="#9c4a2c"/>
+    <text x="28" y="56" class="body" fill="#555048">LLM call</text>
+
+    <line x1="0" y1="72" x2="20" y2="72" class="info-stroke" stroke-dasharray="3 3"/>
+    <polygon points="20,72 16,70 16,74" fill="#3a4f6e"/>
+    <text x="28" y="76" class="body" fill="#555048">WebRTC / external</text>
+
+    <line x1="0" y1="92" x2="20" y2="92" class="positive-stroke" stroke-dasharray="3 3"/>
+    <polygon points="20,92 16,90 16,94" fill="#3f5c3a"/>
+    <text x="28" y="96" class="body" fill="#555048">transcript persist</text>
+  </g>
+</svg>

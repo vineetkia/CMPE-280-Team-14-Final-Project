@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="1200" height="320" font-family="-apple-system, BlinkMacSystemFont, 'Inter Tight', system-ui, sans-serif">
+  <style>
+    .bg { fill: #f4f1ea; }
+    .paper { fill: #fbf8f1; stroke: #15140f1a; stroke-width: 1; }
+    .ink { fill: #15140f; }
+    .ink-3 { fill: #555048; }
+    .ink-4 { fill: #8a857a; }
+    .accent { fill: #9c4a2c; }
+    .hairline-strong { stroke: #15140f33; stroke-width: 1; }
+    .ink-stroke { stroke: #15140f; stroke-width: 1; }
+    .serif { font-family: 'Fraunces', Georgia, serif; }
+    .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; fill: #555048; }
+    .step-num { font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.1em; fill: #9c4a2c; }
+    .title { font-family: 'Fraunces', Georgia, serif; font-size: 16px; font-weight: 500; letter-spacing: -0.015em; fill: #15140f; }
+    .body { font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif; font-size: 11px; fill: #555048; }
+    .eyebrow { font-family: 'JetBrains Mono', monospace; font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase; fill: #8a857a; }
+  </style>
+
+  <rect width="1200" height="320" class="bg"/>
+
+  <text x="40" y="38" class="eyebrow">№ Demo path · the sacred flow</text>
+  <text x="40" y="74" class="serif" font-size="28" font-weight="400" letter-spacing="-0.025em" fill="#15140f">
+    Five steps, <tspan font-style="italic" fill="#9c4a2c">two minutes</tspan>.
+  </text>
+  <line x1="40" y1="92" x2="1160" y2="92" class="ink-stroke"/>
+
+  <!-- Step 01 - Sign in -->
+  <g transform="translate(40, 130)">
+    <rect width="200" height="120" rx="14" class="paper"/>
+    <text x="16" y="26" class="step-num">01 · AUTH</text>
+    <text x="16" y="52" class="title">Sign in</text>
+    <text x="16" y="76" class="body">Email + password →</text>
+    <text x="16" y="92" class="body">GoTrue mints JWT.</text>
+    <text x="16" y="108" class="body" fill="#8a857a" font-style="italic">demo@hyrd.app</text>
+  </g>
+
+  <!-- arrow -->
+  <line x1="252" y1="190" x2="280" y2="190" class="hairline-strong"/>
+  <polygon points="280,190 273,186 273,194" fill="#15140f33"/>
+
+  <!-- Step 02 - Optimizer -->
+  <g transform="translate(290, 130)">
+    <rect width="200" height="120" rx="14" class="paper"/>
+    <text x="16" y="26" class="step-num">02 · OPTIMIZE</text>
+    <text x="16" y="52" class="title">Tailor résumé</text>
+    <text x="16" y="76" class="body">Upload PDF + paste JD.</text>
+    <text x="16" y="92" class="body">GPT-5 returns diff,</text>
+    <text x="16" y="108" class="body">ATS score, annotations.</text>
+  </g>
+
+  <line x1="502" y1="190" x2="530" y2="190" class="hairline-strong"/>
+  <polygon points="530,190 523,186 523,194" fill="#15140f33"/>
+
+  <!-- Step 03 - Kanban move -->
+  <g transform="translate(540, 130)">
+    <rect width="200" height="120" rx="14" class="paper"/>
+    <text x="16" y="26" class="step-num">03 · TRACK</text>
+    <text x="16" y="52" class="title">Move to Interview</text>
+    <text x="16" y="76" class="body">Drag the card →</text>
+    <text x="16" y="92" class="body">accent column highlights,</text>
+    <text x="16" y="108" class="body">drawer auto-opens.</text>
+  </g>
+
+  <line x1="752" y1="190" x2="780" y2="190" class="hairline-strong"/>
+  <polygon points="780,190 773,186 773,194" fill="#15140f33"/>
+
+  <!-- Step 04 - Interview -->
+  <g transform="translate(790, 130)">
+    <rect width="200" height="120" rx="14" fill="#9c4a2c1f" stroke="#9c4a2c" stroke-width="1"/>
+    <text x="16" y="26" class="step-num">04 · INTERVIEW</text>
+    <text x="16" y="52" class="title">2-minute mock</text>
+    <text x="16" y="76" class="body">LiveKit + Deepgram +</text>
+    <text x="16" y="92" class="body">Cartesia. Theater-mode</text>
+    <text x="16" y="108" class="body">orb, live transcript.</text>
+  </g>
+
+  <line x1="1002" y1="190" x2="1030" y2="190" class="hairline-strong"/>
+  <polygon points="1030,190 1023,186 1023,194" fill="#15140f33"/>
+
+  <!-- Step 05 - Dashboard -->
+  <g transform="translate(1040, 130)">
+    <rect width="120" height="120" rx="14" class="paper"/>
+    <text x="14" y="26" class="step-num">05 · SCORE</text>
+    <text x="14" y="52" class="title">Dashboard</text>
+    <text x="14" y="76" class="body">Radial gauge,</text>
+    <text x="14" y="92" class="body">radar, plan.</text>
+  </g>
+
+  <text x="40" y="290" class="eyebrow">Latency target end-to-end · sign-in to dashboard ≤ 4 minutes including a real 2-minute interview</text>
+</svg>
