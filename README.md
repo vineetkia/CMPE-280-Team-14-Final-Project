@@ -138,12 +138,36 @@ Owned the entire infrastructure layer: Docker Compose for six services (Postgres
 
 ## What We Built
 
-Hyrd is a full-stack career platform with four core surfaces:
+Hyrd is a full-stack career platform with four core surfaces. The screens below are from the live build; everything is reproducible end-to-end through the demo account in `## Demo Credentials`.
+
+<p align="center">
+  <img src="docs/img/01-sign-in.png" alt="Sign-in" width="900" />
+  <br/>
+  <em>Sign-in. Editorial split-pane sets the tone before the user touches the product.</em>
+</p>
+
+<p align="center">
+  <img src="docs/img/02-dashboard.png" alt="Dashboard" width="900" />
+  <br/>
+  <em>Dashboard. Greeting hero, up-next interview, and a 30-day performance trend at a glance.</em>
+</p>
 
 ### 1. Resume Optimizer
 Drop a PDF or DOCX, paste any JD, pick tone / length / emphasis. Two LLM hops happen server-side: a light-tier parse converts raw text into a structured résumé (`parsed_json`), then a heavy-tier rewrite tailors it against the JD and returns a strict JSON object with bolded phrases, metrics added, keywords used, ATS score, keyword coverage, and 4–12 change annotations. Both calls are zod-validated with one corrective retry on schema-parse failure.
 
 The output is the **three-pane diff view**: section nav with green `+N` / terracotta `~N` chips on the left, the rendered résumé in LaTeX-CV typography on the center paper card, and per-change approval checkboxes on the right. Toggle any annotation off — the corresponding bullet snaps back to the original parsed version, the ATS score animates down, the keyword-coverage bar shrinks. Hover an annotation card — the corresponding section flashes terracotta in the center pane. Click **Save as PDF** — the print dialog opens with the résumé only, edge-to-edge, no browser chrome, no Hyrd header.
+
+<p align="center">
+  <img src="docs/img/03-optimizer-input.png" alt="Optimizer input" width="900" />
+  <br/>
+  <em>Input view. Upload, JD paste, and the tone / length / emphasis controls.</em>
+</p>
+
+<p align="center">
+  <img src="docs/img/07-optimizer-output.png" alt="Optimizer approval workflow" width="900" />
+  <br/>
+  <em>Output view. Per-change approval, live ATS score recomputation, LaTeX-CV preview.</em>
+</p>
 
 ### 2. Job Tracker (Kanban)
 Five columns: Saved → Applied → Interview → Offer → Rejected. dnd-kit-powered drag with optimistic updates. Custom collision detection — the default `closestCorners` algorithm fails on multi-column kanbans (drops into the wrong column when hovering near boundaries); we wrote a `pointerWithin → rectIntersection → narrowed-closestCorners` recipe that fixes it.
@@ -152,8 +176,20 @@ The Interview column is the **accent** column — terracotta border, a soft acce
 
 Each card has a 3-dot menu — Edit details (opens a full-form modal), Move to… (any of 5 columns), Delete (with confirm). The column `+` buttons open the Add Job modal pre-set to that column's status. The Add Job modal accepts a pasted JD; a fast LLM call extracts company / role / location / salary range / brand color in ~2 seconds.
 
+<p align="center">
+  <img src="docs/img/04-kanban.png" alt="Kanban board" width="900" />
+  <br/>
+  <em>Kanban. Five columns, drag-and-drop, with the Interview column accented in terracotta.</em>
+</p>
+
 ### 3. AI Mock Interview
 **Pre-call lobby**: a real Web Audio `AnalyserNode` drives a 38-bar mic-level visualizer (gates on `getUserMedia`). Three-voice picker with per-card ▶ preview audio (Cartesia Sonic-2 streams a 3-second sample of each voice's cadence). Interviewer-style segmented (Friendly / Neutral / Tough) tunes the system prompt.
+
+<p align="center">
+  <img src="docs/img/06-interview-lobby.png" alt="Interview lobby" width="900" />
+  <br/>
+  <em>Pre-call lobby. Live mic visualizer, voice picker with real Cartesia previews.</em>
+</p>
 
 **Live call**: theater-mode dark canvas with `feTurbulence` grain at 6% opacity. A 240px morphing orb (`radial-gradient` from cream → terracotta → rust) with 80px terracotta glow. The orb's scale is driven by a live `AudioContext + AnalyserNode` reading the actual TTS audio element — when Halden speaks, the orb expands; when you speak, the bottom waveform reacts. 2-minute countdown timer that pulses terracotta in the final 30 seconds. Floating glassmorphic live transcript card on the left.
 
@@ -169,6 +205,12 @@ Six-axis radar with a motion-animated polygon scale-in from the center, dashed c
 Question-by-question section with four cards. Each card: left rail with `Q1`–`Q4` eyebrow, big serif score (color-by-range), elapsed time. Right: italic serif question, the candidate's actual transcript in a sunk-bg italic block, optional terracotta "A better answer would have…" callout with an alternative response.
 
 Filler-words bar chart, WPM sparkline with Q-segment labels, 3-card improvement plan where each card links to a retake. Ink-card footer with **Retake interview** and **Apply learnings to résumé** CTAs. Top-bar **Report** button opens a fully-formatted printable HTML report in a new tab — ⌘P → Save as PDF.
+
+<p align="center">
+  <img src="docs/img/05-performance-dashboard.png" alt="Performance dashboard" width="900" />
+  <br/>
+  <em>Performance dashboard. Radial gauge → six-dimension radar → question-by-question scoring → improvement plan.</em>
+</p>
 
 ---
 
@@ -194,7 +236,7 @@ Filler-words bar chart, WPM sparkline with Q-segment labels, 3-card improvement 
 | Charts | Recharts (radar) + hand-rolled SVG (radial gauge, sparkline) |
 | Resume Parsing | `pdf-parse` (PDF) + `mammoth` (DOCX) |
 | Containerization | Docker Compose (6 services) |
-| Deployment | Vercel (web) + Render/Fly.io (Python agent) + Supabase Cloud or self-hosted Postgres |
+| Deployment | AWS EC2 (single t2.small) — six containers via Docker Compose. Public at `13.52.248.172:3002` |
 
 ---
 
@@ -381,6 +423,49 @@ Plus a sixth — `storage_objects` — that holds résumé file uploads as Postg
 - **`postgres`** runs init scripts at first-boot: `db/init/00-roles.sql` (Supabase-compatible roles), `db/init/10-schema.sql` (the public schema, mirror of `db/schema.sql`), `db/init/20-storage.sql` (the local storage shim)
 - **Multi-stage Next.js build:** deps → builder → runner stages, standalone output, non-root `nextjs` user. Images are minimal (~300MB)
 - **Internal Docker network** — the web container reaches Kong via `http://kong:8000` (set as `SUPABASE_URL_INTERNAL`); the browser uses `http://localhost:8001` (`NEXT_PUBLIC_SUPABASE_URL`). The `lib/supabase/server.ts` helper picks the internal URL when present.
+
+### AWS Deployment
+
+The full stack runs on a single AWS EC2 instance — six containers, one `docker compose up`, no managed services in the data path. Public at `http://13.52.248.172:3002`.
+
+| Setting | Value |
+|---|---|
+| Instance type | `t2.small` (2 vCPU, 2 GiB RAM) |
+| Region · AZ | `us-west-1` · `us-west-1c` |
+| AMI | Ubuntu 24.04 LTS |
+| Public IPv4 | `13.52.248.172` |
+| Storage | 20 GiB gp3 EBS root volume |
+
+<p align="center">
+  <img src="docs/img/08-aws-ec2-instance.png" alt="AWS EC2 instance" width="900" />
+  <br/>
+  <em>EC2 console — instance running, public IP, instance metadata.</em>
+</p>
+
+The security group is intentionally minimal: three inbound ports, everything else closed.
+
+| Port | Protocol | Source | Purpose |
+|---|---|---|---|
+| 22 | TCP | team IPs | SSH for ops |
+| 80 | TCP | `0.0.0.0/0` | HTTP (reserved for the future reverse proxy) |
+| 3002 | TCP | `0.0.0.0/0` | Next.js app (current public entry point) |
+
+<p align="center">
+  <img src="docs/img/09-aws-security-group.png" alt="AWS security group" width="900" />
+  <br/>
+  <em>Security group — three inbound rules, locked-down outbound default.</em>
+</p>
+
+**Bring-up runbook (host):**
+```bash
+ssh -i CMPE-280.pem ubuntu@13.52.248.172
+cd ~/Hyrd
+git pull
+docker compose up -d
+docker compose --profile seed run --rm seed   # one-time, populates demo@sjsu.edu
+```
+
+The voice agent (`docker compose --profile voice up`) is **not** running on the VM — its memory footprint puts a t2.small over the 2 GiB ceiling under load. The interview surface uses the in-process scripted Cartesia fallback in production. Bumping to `t3.medium` (4 GiB) would unlock the live LiveKit path with no other changes.
 
 ---
 
