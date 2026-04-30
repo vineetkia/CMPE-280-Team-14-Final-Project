@@ -1,30 +1,49 @@
 "use client";
 
 /**
- * Demo-mode mock interview.
+ * Live AI interview — real LiveKit pipeline.
  *
- * Why this isn't LiveKit anymore: we have ~2 minutes of stage time per demo,
- * which isn't enough for real STT to produce useful analytics. Instead we
- * play four canned questions through Cartesia (the same voice the user
- * chose in the lobby), capture the user's mic for visualizer reactivity
- * only (no transcription), and on End we show the canonical seed-style
- * report that everyone in the room can read.
+ * Architecture:
+ *   1. Browser mints a room JWT via /api/interview/token (which also pre-creates
+ *      the LiveKit room with metadata so the agent receives JD context).
+ *   2. <LiveKitRoom> connects to wss://… and publishes the user's mic.
+ *   3. The Python agent (`agent/agent.py`) receives the dispatch, joins the
+ *      room, and runs Deepgram STT → Azure GPT-5.4-mini → Cartesia TTS.
+ *   4. Both sides' transcripts are published as `lk.transcription` text and
+ *      consumed via useVoiceAssistant() / useTrackTranscription().
+ *   5. On End: hit /api/interview/end-and-score which decides whether to run
+ *      real scoring (transcript has substance) or fall back to the seed report
+ *      (transcript too short — agent never connected, mic muted, etc).
  *
- * The previous LiveKit-based implementation lives in the git history if we
- * ever want to flip back for a longer demo or production.
+ * Failure modes we handle:
+ *   - LiveKit not configured (no token route response) → fall back to scripted
+ *     demo mode (Cartesia plays 4 canned questions).
+ *   - Agent never joins the room (no dispatch / cloud routing issue) → after
+ *     ~10s with no agent participant, surface a toast and fall back to
+ *     scripted mode.
+ *   - getUserMedia denied → mic visualizer stays at 0 but interview still works.
  */
-import { useEffect, useRef, useState, useTransition } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Mic } from "lucide-react";
 import { toast } from "sonner";
 import { motion, AnimatePresence } from "framer-motion";
+import {
+  LiveKitRoom,
+  RoomAudioRenderer,
+  useLocalParticipant,
+  useRoomContext,
+  useTrackTranscription,
+  useVoiceAssistant,
+} from "@livekit/components-react";
+import { Track, type Track as TrackNS } from "livekit-client";
 import type { Job } from "@/lib/types";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { tween, DUR, EASE_OUT } from "@/components/motion";
 
 const DURATION_MS = 120_000;
 
-const QUESTIONS = [
+const FALLBACK_QUESTIONS = [
   "Hi — thanks for taking the time. Tell me about yourself in sixty seconds.",
   "Walk me through the last project you shipped — what made it hard?",
   "Tell me about a time you had to push back against engineering. What did you do?",
@@ -36,12 +55,13 @@ interface TranscriptTurn {
   role: "interviewer" | "candidate";
   text: string;
   t: number;
+  final: boolean;
 }
 
 export function LiveCall({
-  job: _job,
+  job,
   voice,
-  style: _style,
+  style,
   interviewId,
 }: {
   job: Job;
@@ -49,14 +69,312 @@ export function LiveCall({
   style: string;
   interviewId: string;
 }) {
+  const [token, setToken] = useState<string | null>(null);
+  const [serverUrl, setServerUrl] = useState<string | null>(null);
+  const [tokenError, setTokenError] = useState<string | null>(null);
+  const [fallbackMode, setFallbackMode] = useState(false);
+
+  // Mint a token. If LiveKit is not configured, fall back to scripted demo.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/interview/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ interview_id: interviewId, voice, style }),
+        });
+        const data = await res.json();
+        if (cancelled) return;
+        if (!res.ok) {
+          if (res.status === 503) {
+            // LiveKit not configured; use scripted demo mode.
+            setFallbackMode(true);
+          } else {
+            setTokenError(data.error || "Could not start interview");
+          }
+          return;
+        }
+        setToken(data.token);
+        setServerUrl(data.url);
+      } catch {
+        if (!cancelled) setFallbackMode(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [interviewId, voice, style]);
+
+  if (tokenError) {
+    return (
+      <CallShell>
+        <div style={{ textAlign: "center", maxWidth: 480, padding: 40 }}>
+          <Eyebrow style={{ color: "#a8a397" }}>Unable to start interview</Eyebrow>
+          <p
+            style={{
+              fontFamily: "var(--font-display)",
+              fontStyle: "italic",
+              fontSize: 22,
+              color: "#ece7dc",
+              marginTop: 16,
+            }}
+          >
+            {tokenError}
+          </p>
+        </div>
+      </CallShell>
+    );
+  }
+
+  if (fallbackMode) {
+    return <ScriptedFallback job={job} voice={voice} interviewId={interviewId} />;
+  }
+
+  if (!token || !serverUrl) {
+    return (
+      <CallShell>
+        <Eyebrow style={{ color: "#74706a" }}>Connecting…</Eyebrow>
+      </CallShell>
+    );
+  }
+
+  return (
+    <LiveKitRoom
+      token={token}
+      serverUrl={serverUrl}
+      connect
+      audio
+      video={false}
+      style={{ minHeight: "100vh" }}
+      onError={(err) => {
+        toast.error(`LiveKit error: ${err.message}`);
+        setFallbackMode(true);
+      }}
+    >
+      <RoomAudioRenderer />
+      <CallStage job={job} voice={voice} interviewId={interviewId} />
+    </LiveKitRoom>
+  );
+}
+
+// ─── CallStage — runs inside a connected LiveKitRoom ─────────────────
+function CallStage({
+  job,
+  voice,
+  interviewId,
+}: {
+  job: Job;
+  voice: string;
+  interviewId: string;
+}) {
   const router = useRouter();
+  const room = useRoomContext();
   const startedRef = useRef<number>(Date.now());
 
+  const va = useVoiceAssistant();
+  const agentState = va.state; // "connecting" | "initializing" | "listening" | "thinking" | "speaking" | …
+  const agentAudio = va.audioTrack;
+  const agentSegments = va.agentTranscriptions ?? [];
+
+  const { localParticipant, microphoneTrack } = useLocalParticipant();
+  const userTrans = useTrackTranscription({
+    publication: microphoneTrack,
+    source: Track.Source.Microphone,
+    participant: localParticipant,
+  });
+  const userSegments = userTrans.segments;
+
+  // Real audio amplitudes for the orb + mic waveform.
+  const agentVolume = useTrackVolume(
+    (agentAudio as { publication?: { track?: TrackNS } } | undefined)?.publication?.track ?? null,
+  );
+  const localVolume = useTrackVolume(microphoneTrack?.track ?? null);
+
+  // 2-minute countdown.
+  const [remainingMs, setRemainingMs] = useState(DURATION_MS);
+  const [showTranscript, setShowTranscript] = useState(true);
+  const [showIngestion, setShowIngestion] = useState(false);
+  const [ending, startEnd] = useTransition();
+  const [agentTimedOut, setAgentTimedOut] = useState(false);
+
+  // If no agent has joined within 12 seconds, warn the user and offer a fallback.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const remoteCount = room.remoteParticipants.size;
+      if (remoteCount === 0) {
+        setAgentTimedOut(true);
+        toast.error(
+          "Agent didn't join the room. Click Stop to end and view the report.",
+        );
+      }
+    }, 12_000);
+    return () => clearTimeout(t);
+  }, [room]);
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      const left = Math.max(0, DURATION_MS - (Date.now() - startedRef.current));
+      setRemainingMs(left);
+      if (left <= 0) {
+        clearInterval(t);
+        endInterview();
+      }
+    }, 250);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Merge agent + user transcript segments into a single ordered list.
+  const merged = useMemo<TranscriptTurn[]>(() => {
+    const startMs = startedRef.current;
+    type Segment = {
+      id: string;
+      text: string;
+      firstReceivedTime?: number;
+      final?: boolean;
+    };
+    const norm = (
+      role: "interviewer" | "candidate",
+      src: ReadonlyArray<Segment>,
+    ): TranscriptTurn[] =>
+      src.map((s) => ({
+        id: `${role}-${s.id}`,
+        role,
+        text: s.text,
+        t: Math.max(0, Math.floor(((s.firstReceivedTime ?? Date.now()) - startMs) / 1000)),
+        final: s.final ?? false,
+      }));
+    return [
+      ...norm("interviewer", agentSegments as ReadonlyArray<Segment>),
+      ...norm("candidate", userSegments as ReadonlyArray<Segment>),
+    ].sort((a, b) => a.t - b.t || (a.role === "interviewer" ? -1 : 1));
+  }, [agentSegments, userSegments]);
+
+  const lastInterviewerLine =
+    [...merged].reverse().find((tt) => tt.role === "interviewer")?.text ??
+    (agentState === "connecting" || agentState === "initializing"
+      ? "Connecting to interviewer…"
+      : "Listening…");
+
+  const questionIndex = Math.max(
+    1,
+    Math.min(4, merged.filter((tt) => tt.role === "interviewer" && tt.final).length || 1),
+  );
+
+  function endInterview() {
+    if (ending || showIngestion) return;
+    setShowIngestion(true);
+    startEnd(async () => {
+      try {
+        // Stop publishing audio + disconnect the room before scoring runs.
+        try {
+          await room.disconnect();
+        } catch {
+          /* ignore */
+        }
+        // Send the merged transcript as a fallback for the scoring route.
+        await Promise.all([
+          fetch("/api/interview/end-and-score", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              interview_id: interviewId,
+              transcript: merged.map((m) => ({ role: m.role, text: m.text, t: m.t })),
+            }),
+          }),
+          new Promise((r) => setTimeout(r, 4500)),
+        ]);
+        router.push(`/performance/${interviewId}`);
+      } catch {
+        toast.error("Could not finalize report");
+        setShowIngestion(false);
+      }
+    });
+  }
+
+  const mins = Math.floor(remainingMs / 60_000);
+  const secs = Math.floor((remainingMs % 60_000) / 1000);
+  const lowTime = remainingMs <= 30_000;
+  const isAgentSpeaking = agentState === "speaking";
+  const isAgentListening = agentState === "listening";
+  const orbScale = isAgentSpeaking ? 1 + Math.min(0.08, agentVolume * 0.25) : 1;
+
+  return (
+    <CallShell>
+      <CallTopBar
+        questionIndex={questionIndex}
+        mins={mins}
+        secs={secs}
+        lowTime={lowTime}
+      />
+
+      <div style={{ flex: 1, display: "grid", placeItems: "center", padding: 40, position: "relative" }}>
+        <Orb
+          isAgentSpeaking={isAgentSpeaking}
+          isAgentListening={isAgentListening}
+          agentVolume={agentVolume}
+          orbScale={orbScale}
+          agentState={agentState}
+          voice={voice}
+        />
+
+        <div
+          style={{
+            position: "absolute",
+            bottom: 140,
+            left: 0,
+            right: 0,
+            textAlign: "center",
+            padding: "0 80px",
+          }}
+        >
+          <motion.div
+            key={lastInterviewerLine}
+            initial={{ opacity: 0, y: 6 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={tween(DUR.slow, EASE_OUT)}
+            className="serif"
+            style={{ fontSize: 32, lineHeight: 1.2, letterSpacing: "-0.02em", color: "#fff", fontWeight: 400 }}
+          >
+            “{lastInterviewerLine}”
+          </motion.div>
+        </div>
+      </div>
+
+      <CallBottomBar
+        localVolume={localVolume}
+        isAgentSpeaking={isAgentSpeaking}
+        isAgentListening={isAgentListening}
+        agentTimedOut={agentTimedOut}
+        ending={ending || showIngestion}
+        showTranscript={showTranscript}
+        onToggleTranscript={() => setShowTranscript((v) => !v)}
+        onEnd={endInterview}
+      />
+
+      {showTranscript && <FloatingTranscript turns={merged} voice={voice} />}
+
+      <AnimatePresence>{showIngestion && <IngestionOverlay />}</AnimatePresence>
+    </CallShell>
+  );
+}
+
+// ─── Scripted fallback (LiveKit not configured) ─────────────────────────
+function ScriptedFallback({
+  job: _job,
+  voice,
+  interviewId,
+}: {
+  job: Job;
+  voice: string;
+  interviewId: string;
+}) {
+  const router = useRouter();
+  const startedRef = useRef<number>(Date.now());
   const [remainingMs, setRemainingMs] = useState(DURATION_MS);
   const [questionIndex, setQuestionIndex] = useState(0);
-  const [agentState, setAgentState] = useState<"connecting" | "speaking" | "listening">(
-    "connecting",
-  );
+  const [agentState, setAgentState] = useState<"connecting" | "speaking" | "listening">("connecting");
   const [transcript, setTranscript] = useState<TranscriptTurn[]>([]);
   const [showTranscript, setShowTranscript] = useState(true);
   const [localVolume, setLocalVolume] = useState(0);
@@ -67,7 +385,6 @@ export function LiveCall({
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
 
-  // ─── Real mic capture for the bottom waveform. ──────────────────────
   useEffect(() => {
     let cancelled = false;
     let stream: MediaStream | null = null;
@@ -93,7 +410,7 @@ export function LiveCall({
         };
         tick();
       } catch {
-        // Mic denied — visualizer stays at 0 but the demo still works.
+        /* mic denied — visualizer stays at 0 */
       }
     })();
     return () => {
@@ -104,20 +421,18 @@ export function LiveCall({
     };
   }, []);
 
-  // ─── Question scheduler — plays each question through Cartesia in turn. ─
   useEffect(() => {
     let cancelled = false;
     function commitInterviewerTurn(text: string, i: number) {
       const t = Math.floor((Date.now() - startedRef.current) / 1000);
       setTranscript((prev) => {
         if (prev.some((x) => x.id === `q-${i}`)) return prev;
-        return [...prev, { id: `q-${i}`, role: "interviewer", text, t }];
+        return [...prev, { id: `q-${i}`, role: "interviewer", text, t, final: true }];
       });
       setQuestionIndex(i + 1);
     }
     function scheduleNext(i: number, ms: number) {
       if (cancelled) return;
-      // Add a placeholder candidate turn so the user sees their "side" too.
       setTimeout(() => {
         if (cancelled) return;
         const t = Math.floor((Date.now() - startedRef.current) / 1000);
@@ -128,39 +443,31 @@ export function LiveCall({
             role: "candidate",
             text: "[Your answer is being captured…]",
             t: Math.max(0, t - 6),
+            final: true,
           },
         ]);
       }, 1500);
       setTimeout(() => playQuestion(i + 1), ms);
     }
     async function playQuestion(i: number) {
-      if (cancelled || i >= QUESTIONS.length) return;
+      if (cancelled || i >= FALLBACK_QUESTIONS.length) return;
       setAgentState("connecting");
       try {
         const res = await fetch("/api/tts", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ voice, text: QUESTIONS[i] }),
+          body: JSON.stringify({ voice, text: FALLBACK_QUESTIONS[i] }),
         });
         if (!res.ok) {
-          if (!cancelled) {
-            commitInterviewerTurn(QUESTIONS[i]!, i);
-            scheduleNext(i, 6000);
-          }
+          commitInterviewerTurn(FALLBACK_QUESTIONS[i]!, i);
+          scheduleNext(i, 6000);
           return;
         }
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
-        if (cancelled) {
-          URL.revokeObjectURL(url);
-          return;
-        }
         const audio = new Audio(url);
         audioRef.current = audio;
         audio.addEventListener("ended", () => URL.revokeObjectURL(url));
-
-        // Hook a 2nd analyser to the audio element so the orb amplitude is real.
-        let raf = 0;
         try {
           const ctx = audioCtxRef.current ?? new AudioContext();
           const src = ctx.createMediaElementSource(audio);
@@ -169,32 +476,29 @@ export function LiveCall({
           src.connect(analyser);
           src.connect(ctx.destination);
           const data = new Uint8Array(analyser.frequencyBinCount);
+          let raf = 0;
           const tick = () => {
             analyser.getByteFrequencyData(data);
             let sum = 0;
             for (let k = 0; k < data.length; k++) sum += data[k]! * data[k]!;
-            const rms = Math.sqrt(sum / data.length) / 255;
-            setAgentVolume(rms);
+            setAgentVolume(Math.sqrt(sum / data.length) / 255);
             if (!audio.paused && !audio.ended) raf = requestAnimationFrame(tick);
           };
           audio.addEventListener("play", () => {
             setAgentState("speaking");
-            commitInterviewerTurn(QUESTIONS[i]!, i);
+            commitInterviewerTurn(FALLBACK_QUESTIONS[i]!, i);
             tick();
           });
           audio.addEventListener("ended", () => {
             cancelAnimationFrame(raf);
             setAgentVolume(0);
             setAgentState("listening");
-            // Ten seconds of "your turn" before next Q. With ~10s of audio
-            // per question, total budget = 4 × 20s = 80s, plus settling.
             scheduleNext(i, 10000);
           });
         } catch {
-          // Fall back: play without analyser.
           audio.addEventListener("play", () => {
             setAgentState("speaking");
-            commitInterviewerTurn(QUESTIONS[i]!, i);
+            commitInterviewerTurn(FALLBACK_QUESTIONS[i]!, i);
           });
           audio.addEventListener("ended", () => {
             setAgentState("listening");
@@ -203,10 +507,8 @@ export function LiveCall({
         }
         await audio.play();
       } catch {
-        if (!cancelled) {
-          commitInterviewerTurn(QUESTIONS[i]!, i);
-          scheduleNext(i, 6000);
-        }
+        commitInterviewerTurn(FALLBACK_QUESTIONS[i]!, i);
+        scheduleNext(i, 6000);
       }
     }
     const kickoff = setTimeout(() => playQuestion(0), 600);
@@ -216,10 +518,8 @@ export function LiveCall({
       audioRef.current?.pause();
       audioRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [voice]);
 
-  // ─── Countdown. ─────────────────────────────────────────────────────
   useEffect(() => {
     const t = setInterval(() => {
       const left = Math.max(0, DURATION_MS - (Date.now() - startedRef.current));
@@ -239,12 +539,14 @@ export function LiveCall({
     audioRef.current?.pause();
     startEnd(async () => {
       try {
-        // Minimum 4 seconds of theater so the animation states all play.
         await Promise.all([
-          fetch("/api/interview/demo-report", {
+          fetch("/api/interview/end-and-score", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ interview_id: interviewId }),
+            body: JSON.stringify({
+              interview_id: interviewId,
+              transcript: transcript.map((m) => ({ role: m.role, text: m.text, t: m.t })),
+            }),
           }),
           new Promise((r) => setTimeout(r, 4500)),
         ]);
@@ -261,11 +563,59 @@ export function LiveCall({
   const lowTime = remainingMs <= 30_000;
   const isAgentSpeaking = agentState === "speaking";
   const isAgentListening = agentState === "listening";
-
   const orbScale = isAgentSpeaking ? 1 + Math.min(0.08, agentVolume * 0.25) : 1;
   const lastInterviewerLine =
-    [...transcript].reverse().find((t) => t.role === "interviewer")?.text ?? QUESTIONS[0]!;
+    [...transcript].reverse().find((t) => t.role === "interviewer")?.text ?? FALLBACK_QUESTIONS[0]!;
 
+  return (
+    <CallShell>
+      <CallTopBar
+        questionIndex={Math.min(questionIndex || 1, 4)}
+        mins={mins}
+        secs={secs}
+        lowTime={lowTime}
+      />
+      <div style={{ flex: 1, display: "grid", placeItems: "center", padding: 40, position: "relative" }}>
+        <Orb
+          isAgentSpeaking={isAgentSpeaking}
+          isAgentListening={isAgentListening}
+          agentVolume={agentVolume}
+          orbScale={orbScale}
+          agentState={agentState}
+          voice={voice}
+        />
+        <div style={{ position: "absolute", bottom: 140, left: 0, right: 0, textAlign: "center", padding: "0 80px" }}>
+          <motion.div
+            key={lastInterviewerLine}
+            initial={{ opacity: 0, y: 6 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={tween(DUR.slow, EASE_OUT)}
+            className="serif"
+            style={{ fontSize: 32, lineHeight: 1.2, letterSpacing: "-0.02em", color: "#fff", fontWeight: 400 }}
+          >
+            “{lastInterviewerLine}”
+          </motion.div>
+        </div>
+      </div>
+      <CallBottomBar
+        localVolume={localVolume}
+        isAgentSpeaking={isAgentSpeaking}
+        isAgentListening={isAgentListening}
+        agentTimedOut={false}
+        ending={ending || showIngestion}
+        showTranscript={showTranscript}
+        onToggleTranscript={() => setShowTranscript((v) => !v)}
+        onEnd={endInterview}
+      />
+      {showTranscript && <FloatingTranscript turns={transcript} voice={voice} />}
+      <AnimatePresence>{showIngestion && <IngestionOverlay />}</AnimatePresence>
+    </CallShell>
+  );
+}
+
+// ─── Shared subcomponents ───────────────────────────────────────────────
+
+function CallShell({ children }: { children: React.ReactNode }) {
   return (
     <div
       style={{
@@ -278,7 +628,6 @@ export function LiveCall({
         overflow: "hidden",
       }}
     >
-      {/* Grain overlay */}
       <svg
         aria-hidden="true"
         style={{
@@ -297,247 +646,268 @@ export function LiveCall({
         </filter>
         <rect width="100%" height="100%" filter="url(#grain)" />
       </svg>
-
-      {/* Top bar */}
-      <div
-        style={{
-          padding: "20px 32px",
-          display: "grid",
-          gridTemplateColumns: "1fr auto 1fr",
-          alignItems: "center",
-          borderBottom: "1px solid #ece7dc14",
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <span
-            style={{
-              width: 8,
-              height: 8,
-              borderRadius: 50,
-              background: "#d96b56",
-              boxShadow: "0 0 12px #d96b56",
-            }}
-          />
-          <span
-            className="mono"
-            style={{ fontSize: 11, letterSpacing: "0.16em", textTransform: "uppercase", color: "#a8a397" }}
-          >
-            Recording · {new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
-          </span>
-        </div>
-        <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-          <Eyebrow style={{ color: "#74706a" }}>Question</Eyebrow>
-          <span className="serif tnum" style={{ fontSize: 18, letterSpacing: "-0.01em" }}>
-            {String(Math.min(questionIndex || 1, 4)).padStart(2, "0")}
-          </span>
-          <Eyebrow style={{ color: "#74706a" }}>of 04</Eyebrow>
-        </div>
-        <div style={{ textAlign: "right" }}>
-          <motion.span
-            className="serif tnum"
-            animate={{
-              opacity: lowTime ? [1, 0.5, 1] : 1,
-              color: lowTime ? "#d97a4a" : "#ece7dc",
-            }}
-            transition={lowTime ? { duration: 1, repeat: Infinity } : { duration: 0.2 }}
-            style={{ fontSize: 22, letterSpacing: "-0.02em", display: "inline-block" }}
-          >
-            {String(mins).padStart(2, "0")}:{String(secs).padStart(2, "0")}
-          </motion.span>
-          <span className="mono" style={{ fontSize: 11, color: "#74706a", marginLeft: 6 }}>
-            · remaining
-          </span>
-        </div>
-      </div>
-
-      {/* Center stage */}
-      <div style={{ flex: 1, display: "grid", placeItems: "center", padding: 40, position: "relative" }}>
-        <div
-          style={{
-            position: "relative",
-            width: 460,
-            height: 460,
-            display: "grid",
-            placeItems: "center",
-          }}
-        >
-          {[0, 1, 2, 3].map((i) => (
-            <motion.div
-              key={i}
-              animate={{
-                scale: 1 + (isAgentSpeaking ? agentVolume * 0.06 : 0),
-              }}
-              transition={{ type: "tween", duration: 0.12, ease: "easeOut" }}
-              style={{
-                position: "absolute",
-                width: 140 + i * 70,
-                height: 140 + i * 70,
-                borderRadius: "50%",
-                border: "1px solid #ece7dc14",
-                opacity: 1 - i * 0.18,
-              }}
-            />
-          ))}
-          <div
-            style={{
-              position: "absolute",
-              width: 380,
-              height: 380,
-              borderRadius: "50%",
-              background: "radial-gradient(circle at 40% 35%, #d97a4a44, transparent 65%)",
-              filter: "blur(8px)",
-            }}
-          />
-          <motion.div
-            animate={{ scale: orbScale }}
-            transition={{ type: "tween", duration: 0.08, ease: "linear" }}
-            style={{
-              position: "absolute",
-              width: 240,
-              height: 240,
-              borderRadius: "50%",
-              background: "radial-gradient(circle at 35% 30%, #f4d4b8, #d97a4a 55%, #9c4a2c 100%)",
-              boxShadow:
-                "0 0 80px #d97a4a40, inset -20px -30px 60px #00000040, inset 20px 20px 50px #ffffff20",
-            }}
-          />
-          <div
-            style={{
-              position: "absolute",
-              width: 60,
-              height: 60,
-              borderRadius: "50%",
-              background: "radial-gradient(circle, #fff8, transparent 70%)",
-              top: 130,
-              left: 130,
-            }}
-          />
-          <div style={{ position: "absolute", bottom: -40, textAlign: "center" }}>
-            <span
-              className="mono"
-              style={{
-                fontSize: 11,
-                letterSpacing: "0.18em",
-                textTransform: "uppercase",
-                color: isAgentSpeaking ? "#d97a4a" : "#74706a",
-              }}
-            >
-              ●{" "}
-              {agentState === "connecting"
-                ? "Connecting"
-                : isAgentSpeaking
-                  ? `${voice} is speaking`
-                  : "Listening to you"}
-            </span>
-          </div>
-        </div>
-
-        <div
-          style={{
-            position: "absolute",
-            bottom: 140,
-            left: 0,
-            right: 0,
-            textAlign: "center",
-            padding: "0 80px",
-          }}
-        >
-          <motion.div
-            key={lastInterviewerLine}
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={tween(DUR.slow, EASE_OUT)}
-            className="serif"
-            style={{ fontSize: 32, lineHeight: 1.2, letterSpacing: "-0.02em", color: "#fff", fontWeight: 400 }}
-          >
-            “{lastInterviewerLine}”
-          </motion.div>
-        </div>
-      </div>
-
-      {/* Bottom bar */}
-      <div
-        style={{
-          padding: "20px 32px 28px",
-          display: "grid",
-          gridTemplateColumns: "1fr auto 1fr",
-          alignItems: "center",
-          gap: 24,
-          borderTop: "1px solid #ece7dc14",
-          position: "relative",
-          zIndex: 2,
-        }}
-      >
-        <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-          <span
-            style={{
-              width: 36,
-              height: 36,
-              borderRadius: 50,
-              background: "#ece7dc14",
-              display: "grid",
-              placeItems: "center",
-              border: "1px solid #ece7dc20",
-            }}
-          >
-            <Mic size={16} />
-          </span>
-          <MicWaveform volume={localVolume} />
-          <span
-            className="mono"
-            style={{ fontSize: 10.5, letterSpacing: "0.12em", textTransform: "uppercase", color: "#74706a" }}
-          >
-            Your mic · {isAgentSpeaking ? "muted while AI speaks" : isAgentListening ? "open" : "standby"}
-          </span>
-        </div>
-
-        <button
-          type="button"
-          onClick={endInterview}
-          disabled={ending || showIngestion}
-          aria-label="End interview"
-          style={{
-            width: 78,
-            height: 78,
-            borderRadius: 50,
-            background: "#d96b56",
-            color: "#14130e",
-            border: "none",
-            cursor: ending || showIngestion ? "not-allowed" : "pointer",
-            display: "grid",
-            placeItems: "center",
-            boxShadow: "0 0 0 8px #d96b5614, 0 0 28px #d96b5640",
-          }}
-        >
-          <span style={{ width: 24, height: 24, background: "#14130e", borderRadius: 4 }} />
-        </button>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 14, justifyContent: "flex-end" }}>
-          <span
-            className="mono"
-            style={{ fontSize: 10.5, letterSpacing: "0.12em", textTransform: "uppercase", color: "#74706a" }}
-          >
-            Live transcript
-          </span>
-          <button
-            type="button"
-            className="toggle"
-            aria-checked={showTranscript}
-            role="switch"
-            onClick={() => setShowTranscript((v) => !v)}
-            style={{ background: showTranscript ? "#d97a4a" : undefined }}
-          />
-        </div>
-      </div>
-
-      {showTranscript && <FloatingTranscript turns={transcript} voice={voice} />}
-
-      <AnimatePresence>{showIngestion && <IngestionOverlay />}</AnimatePresence>
+      {children}
     </div>
   );
 }
 
-// ─── Bottom mic waveform — 22 bars driven by local volume ──────────
+function CallTopBar({
+  questionIndex,
+  mins,
+  secs,
+  lowTime,
+}: {
+  questionIndex: number;
+  mins: number;
+  secs: number;
+  lowTime: boolean;
+}) {
+  return (
+    <div
+      style={{
+        padding: "20px 32px",
+        display: "grid",
+        gridTemplateColumns: "1fr auto 1fr",
+        alignItems: "center",
+        borderBottom: "1px solid #ece7dc14",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <span
+          style={{
+            width: 8,
+            height: 8,
+            borderRadius: 50,
+            background: "#d96b56",
+            boxShadow: "0 0 12px #d96b56",
+          }}
+        />
+        <span
+          className="mono"
+          style={{ fontSize: 11, letterSpacing: "0.16em", textTransform: "uppercase", color: "#a8a397" }}
+        >
+          Recording · {new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}
+        </span>
+      </div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+        <Eyebrow style={{ color: "#74706a" }}>Question</Eyebrow>
+        <span className="serif tnum" style={{ fontSize: 18, letterSpacing: "-0.01em" }}>
+          {String(questionIndex).padStart(2, "0")}
+        </span>
+        <Eyebrow style={{ color: "#74706a" }}>of 04</Eyebrow>
+      </div>
+      <div style={{ textAlign: "right" }}>
+        <motion.span
+          className="serif tnum"
+          animate={{
+            opacity: lowTime ? [1, 0.5, 1] : 1,
+            color: lowTime ? "#d97a4a" : "#ece7dc",
+          }}
+          transition={lowTime ? { duration: 1, repeat: Infinity } : { duration: 0.2 }}
+          style={{ fontSize: 22, letterSpacing: "-0.02em", display: "inline-block" }}
+        >
+          {String(mins).padStart(2, "0")}:{String(secs).padStart(2, "0")}
+        </motion.span>
+        <span className="mono" style={{ fontSize: 11, color: "#74706a", marginLeft: 6 }}>
+          · remaining
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function CallBottomBar({
+  localVolume,
+  isAgentSpeaking,
+  isAgentListening,
+  agentTimedOut,
+  ending,
+  showTranscript,
+  onToggleTranscript,
+  onEnd,
+}: {
+  localVolume: number;
+  isAgentSpeaking: boolean;
+  isAgentListening: boolean;
+  agentTimedOut: boolean;
+  ending: boolean;
+  showTranscript: boolean;
+  onToggleTranscript: () => void;
+  onEnd: () => void;
+}) {
+  return (
+    <div
+      style={{
+        padding: "20px 32px 28px",
+        display: "grid",
+        gridTemplateColumns: "1fr auto 1fr",
+        alignItems: "center",
+        gap: 24,
+        borderTop: "1px solid #ece7dc14",
+        position: "relative",
+        zIndex: 2,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+        <span
+          style={{
+            width: 36,
+            height: 36,
+            borderRadius: 50,
+            background: "#ece7dc14",
+            display: "grid",
+            placeItems: "center",
+            border: "1px solid #ece7dc20",
+          }}
+        >
+          <Mic size={16} />
+        </span>
+        <MicWaveform volume={localVolume} />
+        <span
+          className="mono"
+          style={{ fontSize: 10.5, letterSpacing: "0.12em", textTransform: "uppercase", color: "#74706a" }}
+        >
+          Your mic ·{" "}
+          {agentTimedOut
+            ? "no agent — click stop"
+            : isAgentSpeaking
+              ? "muted while AI speaks"
+              : isAgentListening
+                ? "open"
+                : "standby"}
+        </span>
+      </div>
+      <button
+        type="button"
+        onClick={onEnd}
+        disabled={ending}
+        aria-label="End interview"
+        style={{
+          width: 78,
+          height: 78,
+          borderRadius: 50,
+          background: "#d96b56",
+          color: "#14130e",
+          border: "none",
+          cursor: ending ? "not-allowed" : "pointer",
+          display: "grid",
+          placeItems: "center",
+          boxShadow: "0 0 0 8px #d96b5614, 0 0 28px #d96b5640",
+        }}
+      >
+        <span style={{ width: 24, height: 24, background: "#14130e", borderRadius: 4 }} />
+      </button>
+      <div style={{ display: "flex", alignItems: "center", gap: 14, justifyContent: "flex-end" }}>
+        <span
+          className="mono"
+          style={{ fontSize: 10.5, letterSpacing: "0.12em", textTransform: "uppercase", color: "#74706a" }}
+        >
+          Live transcript
+        </span>
+        <button
+          type="button"
+          className="toggle"
+          aria-checked={showTranscript}
+          role="switch"
+          onClick={onToggleTranscript}
+          style={{ background: showTranscript ? "#d97a4a" : undefined }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function Orb({
+  isAgentSpeaking,
+  isAgentListening,
+  agentVolume,
+  orbScale,
+  agentState,
+  voice,
+}: {
+  isAgentSpeaking: boolean;
+  isAgentListening: boolean;
+  agentVolume: number;
+  orbScale: number;
+  agentState: string;
+  voice: string;
+}) {
+  return (
+    <div style={{ position: "relative", width: 460, height: 460, display: "grid", placeItems: "center" }}>
+      {[0, 1, 2, 3].map((i) => (
+        <motion.div
+          key={i}
+          animate={{ scale: 1 + (isAgentSpeaking ? agentVolume * 0.06 : 0) }}
+          transition={{ type: "tween", duration: 0.12, ease: "easeOut" }}
+          style={{
+            position: "absolute",
+            width: 140 + i * 70,
+            height: 140 + i * 70,
+            borderRadius: "50%",
+            border: "1px solid #ece7dc14",
+            opacity: 1 - i * 0.18,
+          }}
+        />
+      ))}
+      <div
+        style={{
+          position: "absolute",
+          width: 380,
+          height: 380,
+          borderRadius: "50%",
+          background: "radial-gradient(circle at 40% 35%, #d97a4a44, transparent 65%)",
+          filter: "blur(8px)",
+        }}
+      />
+      <motion.div
+        animate={{ scale: orbScale }}
+        transition={{ type: "tween", duration: 0.08, ease: "linear" }}
+        style={{
+          position: "absolute",
+          width: 240,
+          height: 240,
+          borderRadius: "50%",
+          background: "radial-gradient(circle at 35% 30%, #f4d4b8, #d97a4a 55%, #9c4a2c 100%)",
+          boxShadow: "0 0 80px #d97a4a40, inset -20px -30px 60px #00000040, inset 20px 20px 50px #ffffff20",
+        }}
+      />
+      <div
+        style={{
+          position: "absolute",
+          width: 60,
+          height: 60,
+          borderRadius: "50%",
+          background: "radial-gradient(circle, #fff8, transparent 70%)",
+          top: 130,
+          left: 130,
+        }}
+      />
+      <div style={{ position: "absolute", bottom: -40, textAlign: "center" }}>
+        <span
+          className="mono"
+          style={{
+            fontSize: 11,
+            letterSpacing: "0.18em",
+            textTransform: "uppercase",
+            color: isAgentSpeaking ? "#d97a4a" : "#74706a",
+          }}
+        >
+          ●{" "}
+          {agentState === "connecting" || agentState === "initializing"
+            ? "Connecting"
+            : isAgentSpeaking
+              ? `${voice} is speaking`
+              : isAgentListening
+                ? "Listening to you"
+                : agentState === "thinking"
+                  ? "Thinking…"
+                  : "Standby"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 function MicWaveform({ volume }: { volume: number }) {
   const bars = 22;
   const heights = Array.from({ length: bars }, (_, i) => {
@@ -565,7 +935,6 @@ function MicWaveform({ volume }: { volume: number }) {
   );
 }
 
-// ─── Floating glass transcript card ────────────────────────────────
 function FloatingTranscript({ turns, voice }: { turns: TranscriptTurn[]; voice: string }) {
   const scrollerRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -605,7 +974,7 @@ function FloatingTranscript({ turns, voice }: { turns: TranscriptTurn[]; voice: 
             <motion.div
               key={t.id}
               initial={{ opacity: 0, y: 4 }}
-              animate={{ opacity: 1, y: 0 }}
+              animate={{ opacity: t.final ? 1 : 0.7, y: 0 }}
               transition={tween(DUR.slow, EASE_OUT)}
             >
               <span
@@ -620,7 +989,21 @@ function FloatingTranscript({ turns, voice }: { turns: TranscriptTurn[]; voice: 
                 {isInt ? voice : "You"} · {Math.floor(t.t / 60)}:
                 {String(t.t % 60).padStart(2, "0")}
               </span>
-              <p style={{ margin: "2px 0 0", color: isInt ? "#d8d3c5" : "#ece7dc" }}>{t.text}</p>
+              <p style={{ margin: "2px 0 0", color: isInt ? "#d8d3c5" : "#ece7dc" }}>
+                {t.text}
+                {!t.final && (
+                  <span
+                    style={{
+                      background: "#fff2",
+                      color: "#fff",
+                      padding: "0 2px",
+                      marginLeft: 4,
+                    }}
+                  >
+                    …
+                  </span>
+                )}
+              </p>
             </motion.div>
           );
         })}
@@ -629,7 +1012,6 @@ function FloatingTranscript({ turns, voice }: { turns: TranscriptTurn[]; voice: 
   );
 }
 
-// ─── Ingestion overlay — shown while we "process" the demo report. ──────
 function IngestionOverlay() {
   const stages = [
     "Capturing transcript",
@@ -662,7 +1044,6 @@ function IngestionOverlay() {
       }}
     >
       <div style={{ width: 460, maxWidth: "90vw", textAlign: "center" }}>
-        {/* Pulsing core */}
         <div style={{ position: "relative", height: 140, display: "grid", placeItems: "center" }}>
           {[0, 1, 2].map((i) => (
             <motion.div
@@ -686,21 +1067,12 @@ function IngestionOverlay() {
               width: 80,
               height: 80,
               borderRadius: "50%",
-              background:
-                "radial-gradient(circle at 35% 30%, #f4d4b8, #d97a4a 55%, #9c4a2c 100%)",
+              background: "radial-gradient(circle at 35% 30%, #f4d4b8, #d97a4a 55%, #9c4a2c 100%)",
               boxShadow: "0 0 60px #d97a4a44",
             }}
           />
         </div>
-
-        <div
-          style={{
-            marginTop: 20,
-            fontFamily: "var(--font-display)",
-            fontSize: 24,
-            letterSpacing: "-0.02em",
-          }}
-        >
+        <div style={{ marginTop: 20, fontFamily: "var(--font-display)", fontSize: 24, letterSpacing: "-0.02em" }}>
           <span>Generating your report</span>
           <motion.span
             animate={{ opacity: [0.2, 1, 0.2] }}
@@ -709,7 +1081,6 @@ function IngestionOverlay() {
             …
           </motion.span>
         </div>
-
         <div style={{ marginTop: 28, display: "flex", flexDirection: "column", gap: 8 }}>
           {stages.map((label, i) => {
             const state = i < stage ? "done" : i === stage ? "active" : "pending";
@@ -729,12 +1100,7 @@ function IngestionOverlay() {
                 <motion.span
                   animate={{
                     background: state === "done" ? "#d97a4a" : "transparent",
-                    borderColor:
-                      state === "done"
-                        ? "#d97a4a"
-                        : state === "active"
-                          ? "#d97a4a"
-                          : "#ece7dc33",
+                    borderColor: state === "done" ? "#d97a4a" : state === "active" ? "#d97a4a" : "#ece7dc33",
                     color: state === "done" ? "#14130e" : "#ece7dc",
                   }}
                   style={{
@@ -773,4 +1139,36 @@ function IngestionOverlay() {
       </div>
     </motion.div>
   );
+}
+
+// ─── useTrackVolume — sample audio analyser at 60fps ─────────────────────
+function useTrackVolume(track: TrackNS | null): number {
+  const [volume, setVolume] = useState(0);
+  useEffect(() => {
+    if (!track || !track.mediaStream) {
+      setVolume(0);
+      return;
+    }
+    const ctx = new AudioContext();
+    const source = ctx.createMediaStreamSource(track.mediaStream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    let raf = 0;
+    const tick = () => {
+      analyser.getByteFrequencyData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) sum += data[i]! * data[i]!;
+      const rms = Math.sqrt(sum / data.length) / 255;
+      setVolume(rms);
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(raf);
+      ctx.close();
+    };
+  }, [track]);
+  return volume;
 }

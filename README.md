@@ -108,7 +108,7 @@ Built with Next.js 15 (App Router, TypeScript strict mode), backed by a Postgres
 - **4 interconnected surfaces** in one workspace — Resume Optimizer, Job Tracker, AI Mock Interview, Performance Dashboard
 - **Per-change approval workflow** for résumé edits — every Azure suggestion is a checkbox; toggle to include/exclude. Résumé re-renders against the original parsed version; ATS / keyword-coverage / quantification / readability scores recompute deterministically on each toggle
 - **LaTeX-CV typography** for the résumé output — Latin Modern Roman (with EB Garamond fallback), classic article{} layout, single horizontal rule under the centered name. **Save as PDF** triggers `window.print()` against a `@media print` stylesheet that hides every chrome region and stretches the résumé edge to edge
-- **Editorial design system** — ported verbatim from `design_handoff_hyrd/design_reference/tokens.css`. Two easing curves, four durations, hairline 1px rules, Fraunces serif, no gradients except the live-interview orb
+- **Editorial design system** — defined in `web/app/globals.css` as a CSS-variable token system (ivory canvas, terracotta accent, hairline 1px rules everywhere, Fraunces serif for display, Geist for body, JetBrains Mono for labels). Two easing curves, four durations, no gradients except the live-interview orb
 - **Real voice pipeline** — Cartesia Sonic-2 TTS streams the interviewer's voice; the orb's amplitude is driven by a live `AudioContext + AnalyserNode` reading the audio element. Real `getUserMedia` for the user's mic visualizer
 - **Demo-mode interview** — 4 scripted questions through Cartesia in 2 minutes, then a canonical seed-style report with full Q-by-Q feedback. Built specifically for the 2-minute demo window where real-time STT analytics aren't viable
 - **Six dockerized services** — Postgres, GoTrue (auth), PostgREST (RLS-scoped data API), Kong (API gateway), Next.js web, optional Python LiveKit voice agent
@@ -202,7 +202,7 @@ Filler-words bar chart, WPM sparkline with Q-segment labels, 3-card improvement 
 
 ### Editorial Design Language
 
-The entire UI is ported verbatim from the design handoff at `design_handoff_hyrd/design_reference/tokens.css`. The aesthetic is **editorial / serif** — newsprint-grade typography on warm ivory. References: NYT meets Linear meets a literary quarterly. Anti-references: gradient-heavy SaaS dashboards, glassmorphism on light surfaces, AI-startup vibe.
+The entire UI is built on a CSS-variable token system defined in `web/app/globals.css`. The aesthetic is **editorial / serif** — newsprint-grade typography on warm ivory. References: NYT meets Linear meets a literary quarterly. Anti-references: gradient-heavy SaaS dashboards, glassmorphism on light surfaces, AI-startup vibe.
 
 ```css
 /* web/app/globals.css */
@@ -623,10 +623,9 @@ The whole stack is configured via a single root `.env`. Copy `.env.example` and 
 │       ├── 00-roles.sql            # Supabase-compatible roles
 │       ├── 10-schema.sql           # public schema
 │       └── 20-storage.sql          # bytea storage shim
-├── infra/
-│   ├── kong.yml                    # API gateway declarative config
-│   └── sign-jwts.mjs               # Mint ANON + SERVICE_ROLE keys for a new JWT_SECRET
-└── design_handoff_hyrd/            # original design system (read-only, ported into globals.css)
+└── infra/
+    ├── kong.yml                    # API gateway declarative config
+    └── sign-jwts.mjs               # Mint ANON + SERVICE_ROLE keys for a new JWT_SECRET
 ```
 
 ---
@@ -799,7 +798,6 @@ Component-based architecture enabled five people to work in parallel without con
 
 ## Acknowledgments
 
-- Original Hyrd design handoff (`design_handoff_hyrd/`) — typography, color, motion language all ported verbatim
 - [Radix UI](https://www.radix-ui.com/) for accessible Dialog and Tabs primitives
 - [Lucide](https://lucide.dev/) for the icon set
 - [Framer Motion](https://www.framer.com/motion/) for the animation system

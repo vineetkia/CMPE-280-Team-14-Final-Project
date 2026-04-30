@@ -50,21 +50,46 @@ class CallState:
 
 def system_prompt(role: str, company: str, jd: str, style: str) -> str:
     style_note = {
-        "friendly": "warm, encouraging, but candid",
+        "friendly": "warm and encouraging, but candid",
         "neutral": "composed and professional",
         "tough": "direct and probing, no softening",
     }.get(style, "composed and professional")
     return f"""You are a senior interviewer at {company} interviewing the candidate for the {role} role.
 
-The interview is exactly 2 minutes. Ask 3-4 questions total.
-Open with a warm 1-sentence intro and a behavioral opener.
-Then ask one role-specific technical question informed by the JD below.
-Then one situational follow-up.
-Keep your turns under 12 seconds of speech. Be {style_note}.
-End with: "Thanks - that's all from me."
-Never reveal you are an AI. Never use exclamation marks.
+This is a 2-minute mock interview. You will ask exactly FOUR questions in this
+order, and after the candidate answers each one you will give a brief 1-sentence
+acknowledgement before moving to the next.
 
-JD excerpt:
+CONVERSATION FLOW:
+
+1. OPENER — Greet briefly (one short sentence), then ask:
+   "Tell me about yourself in sixty seconds."
+
+2. After they answer, acknowledge in ONE sentence (e.g. "Got it — thanks for the
+   overview." or "Helpful framing.") then ask:
+   "Walk me through the last project you shipped — what made it hard?"
+
+3. After they answer, acknowledge in ONE sentence then ask:
+   "Tell me about a time you had to push back against engineering. What did you do?"
+
+4. After they answer, acknowledge in ONE sentence then ask the role-specific
+   closer about why this role at this company (e.g. "Why {company}?" or
+   "Why this role?"). Use the JD context below to make it specific.
+
+5. After their final answer, give a brief 1-sentence wrap-up acknowledgement
+   then say exactly: "Thanks — that's all from me."
+
+RULES (these are non-negotiable):
+- Be {style_note}.
+- Each turn under 10 seconds of speech (about 25 words). NEVER monologue.
+- Acknowledgements are short — one sentence, no analysis, no follow-ups.
+- Wait for the candidate to actually finish before moving on.
+- Do NOT read the question number aloud. Just ask the question.
+- Do NOT reveal you are an AI. Do NOT use exclamation marks.
+- Do NOT add follow-up probes mid-question. One question per turn.
+- If the candidate goes long, let them finish — do not interrupt.
+
+JD CONTEXT (for the role-specific closer):
 ---
 {jd[:2000]}
 ---"""
@@ -193,24 +218,30 @@ async def entrypoint(ctx: JobContext) -> None:
     def _on_room_close(*_args, **_kwargs) -> None:
         asyncio.create_task(do_flush())
 
-    # Greet the candidate to start the clock.
-    await asyncio.sleep(0.4)
-    await session.say(
-        "Hi — thanks for taking the time. Let's begin. Tell me about yourself in sixty seconds.",
-        allow_interruptions=True,
-    )
+    # Kick off the LLM so it generates the greeting + first question itself.
+    # We deliberately do NOT use session.say() here — that bypasses the LLM and
+    # makes the agent feel scripted. Instead, generate_reply prompts the LLM
+    # with the instructions in the system prompt, which already enumerates the
+    # 4-question flow with acknowledgements between answers.
+    await asyncio.sleep(0.5)
+    try:
+        await session.generate_reply(
+            instructions=(
+                "Begin the interview now. Greet the candidate briefly in one short "
+                "sentence, then ask the first question: 'Tell me about yourself in "
+                "sixty seconds.' Wait for them to answer before continuing."
+            )
+        )
+    except Exception as exc:
+        logger.exception("Could not kick off interview: %s", exc)
 
-    # Run for ~2 minutes, then close out.
-    deadline = state.started_at + 125
+    # Run for the 2-minute interview window. Cut a few seconds before the
+    # browser-side timer (the browser fires "End" at exactly 2:00).
+    deadline = state.started_at + 118
     while time.time() < deadline:
         if not ctx.room.remote_participants:
             break
         await asyncio.sleep(1)
-
-    try:
-        await session.say("Thanks — that's all from me.", allow_interruptions=False)
-    except Exception:
-        pass
 
     await asyncio.sleep(2)
     await do_flush()
