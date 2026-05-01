@@ -1,42 +1,23 @@
 "use client";
 
 /**
- * Live AI interview — real LiveKit pipeline.
+ * Live AI interview — Cartesia-only scripted pipeline.
  *
- * Architecture:
- *   1. Browser mints a room JWT via /api/interview/token (which also pre-creates
- *      the LiveKit room with metadata so the agent receives JD context).
- *   2. <LiveKitRoom> connects to wss://… and publishes the user's mic.
- *   3. The Python agent (`agent/agent.py`) receives the dispatch, joins the
- *      room, and runs Deepgram STT → Azure GPT-5.4-mini → Cartesia TTS.
- *   4. Both sides' transcripts are published as `lk.transcription` text and
- *      consumed via useVoiceAssistant() / useTrackTranscription().
- *   5. On End: hit /api/interview/end-and-score which decides whether to run
- *      real scoring (transcript has substance) or fall back to the seed report
- *      (transcript too short — agent never connected, mic muted, etc).
+ * Pipeline:
+ *   1. Cartesia plays 4 background-themed questions in sequence (~8–10s each).
+ *   2. The candidate's mic is streamed to Deepgram Nova-3 over a browser
+ *      WebSocket (token minted via /api/deepgram-token).
+ *   3. After the 4th question's audio ends + a 20s answer window, the call
+ *      auto-ends and routes to the seed performance report.
  *
- * Failure modes we handle:
- *   - LiveKit not configured (no token route response) → fall back to scripted
- *     demo mode (Cartesia plays 4 canned questions).
- *   - Agent never joins the room (no dispatch / cloud routing issue) → after
- *     ~10s with no agent participant, surface a toast and fall back to
- *     scripted mode.
- *   - getUserMedia denied → mic visualizer stays at 0 but interview still works.
+ * No LiveKit, no real-time agent. The component is intentionally narrow —
+ * deterministic question order, fixed timing, predictable end condition.
  */
-import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { useCallback, useEffect, useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { Mic } from "lucide-react";
 import { toast } from "sonner";
 import { motion, AnimatePresence } from "framer-motion";
-import {
-  LiveKitRoom,
-  RoomAudioRenderer,
-  useLocalParticipant,
-  useRoomContext,
-  useTrackTranscription,
-  useVoiceAssistant,
-} from "@livekit/components-react";
-import { Track, type Track as TrackNS } from "livekit-client";
 import type { Job } from "@/lib/types";
 import { Eyebrow } from "@/components/ui/eyebrow";
 import { tween, DUR, EASE_OUT } from "@/components/motion";
@@ -47,9 +28,9 @@ import {
 
 const DURATION_MS = 120_000;
 
-// Background-themed scripted questions for the 2-minute demo. Each is short
-// enough that Cartesia takes about 8–10 seconds of audio.
-const FALLBACK_QUESTIONS = [
+// Background-themed scripted questions for the 2-minute interview. Each is
+// short enough that Cartesia takes about 8–10 seconds of audio.
+const QUESTIONS = [
   "Hi — thanks for taking the time. To start, tell me about yourself in sixty seconds.",
   "Walk me through your background — your school, your work so far, and what you've shipped.",
   "What technologies are you strongest in, and why did you gravitate toward them?",
@@ -75,7 +56,7 @@ interface TranscriptTurn {
 export function LiveCall({
   job,
   voice,
-  style,
+  style: _style,
   interviewId,
 }: {
   job: Job;
@@ -83,299 +64,11 @@ export function LiveCall({
   style: string;
   interviewId: string;
 }) {
-  const [token, setToken] = useState<string | null>(null);
-  const [serverUrl, setServerUrl] = useState<string | null>(null);
-  const [tokenError, setTokenError] = useState<string | null>(null);
-  const [fallbackMode, setFallbackMode] = useState(false);
-
-  // Mint a token. If LiveKit is not configured, fall back to scripted demo.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await fetch("/api/interview/token", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ interview_id: interviewId, voice, style }),
-        });
-        const data = await res.json();
-        if (cancelled) return;
-        if (!res.ok) {
-          if (res.status === 503) {
-            // LiveKit not configured; use scripted demo mode.
-            setFallbackMode(true);
-          } else {
-            setTokenError(data.error || "Could not start interview");
-          }
-          return;
-        }
-        setToken(data.token);
-        setServerUrl(data.url);
-      } catch {
-        if (!cancelled) setFallbackMode(true);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [interviewId, voice, style]);
-
-  if (tokenError) {
-    return (
-      <CallShell>
-        <div style={{ textAlign: "center", maxWidth: 480, padding: 40 }}>
-          <Eyebrow style={{ color: "#a8a397" }}>Unable to start interview</Eyebrow>
-          <p
-            style={{
-              fontFamily: "var(--font-display)",
-              fontStyle: "italic",
-              fontSize: 22,
-              color: "#ece7dc",
-              marginTop: 16,
-            }}
-          >
-            {tokenError}
-          </p>
-        </div>
-      </CallShell>
-    );
-  }
-
-  if (fallbackMode) {
-    return <ScriptedFallback job={job} voice={voice} interviewId={interviewId} />;
-  }
-
-  if (!token || !serverUrl) {
-    return (
-      <CallShell>
-        <Eyebrow style={{ color: "#74706a" }}>Connecting…</Eyebrow>
-      </CallShell>
-    );
-  }
-
-  return (
-    <LiveKitRoom
-      token={token}
-      serverUrl={serverUrl}
-      connect
-      audio
-      video={false}
-      style={{ minHeight: "100vh" }}
-      onError={(err) => {
-        toast.error(`LiveKit error: ${err.message}`);
-        setFallbackMode(true);
-      }}
-    >
-      <RoomAudioRenderer />
-      <CallStage job={job} voice={voice} interviewId={interviewId} />
-    </LiveKitRoom>
-  );
+  return <ScriptedCall job={job} voice={voice} interviewId={interviewId} />;
 }
 
-// ─── CallStage — runs inside a connected LiveKitRoom ─────────────────
-function CallStage({
-  job,
-  voice,
-  interviewId,
-}: {
-  job: Job;
-  voice: string;
-  interviewId: string;
-}) {
-  const router = useRouter();
-  const room = useRoomContext();
-  const startedRef = useRef<number>(Date.now());
-
-  const va = useVoiceAssistant();
-  const agentState = va.state; // "connecting" | "initializing" | "listening" | "thinking" | "speaking" | …
-  const agentAudio = va.audioTrack;
-  const agentSegments = va.agentTranscriptions ?? [];
-
-  const { localParticipant, microphoneTrack } = useLocalParticipant();
-  const userTrans = useTrackTranscription({
-    publication: microphoneTrack,
-    source: Track.Source.Microphone,
-    participant: localParticipant,
-  });
-  const userSegments = userTrans.segments;
-
-  // Real audio amplitudes for the orb + mic waveform.
-  const agentVolume = useTrackVolume(
-    (agentAudio as { publication?: { track?: TrackNS } } | undefined)?.publication?.track ?? null,
-  );
-  const localVolume = useTrackVolume(microphoneTrack?.track ?? null);
-
-  // 2-minute countdown.
-  const [remainingMs, setRemainingMs] = useState(DURATION_MS);
-  const [showTranscript, setShowTranscript] = useState(true);
-  const [showIngestion, setShowIngestion] = useState(false);
-  const [ending, startEnd] = useTransition();
-  const [agentTimedOut, setAgentTimedOut] = useState(false);
-
-  // If no agent has joined within 12 seconds, warn the user and offer a fallback.
-  useEffect(() => {
-    const t = setTimeout(() => {
-      const remoteCount = room.remoteParticipants.size;
-      if (remoteCount === 0) {
-        setAgentTimedOut(true);
-        toast.error(
-          "Agent didn't join the room. Click Stop to end and view the report.",
-        );
-      }
-    }, 12_000);
-    return () => clearTimeout(t);
-  }, [room]);
-
-  useEffect(() => {
-    const t = setInterval(() => {
-      const left = Math.max(0, DURATION_MS - (Date.now() - startedRef.current));
-      setRemainingMs(left);
-      if (left <= 0) {
-        clearInterval(t);
-        endInterview();
-      }
-    }, 250);
-    return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Merge agent + user transcript segments into a single ordered list.
-  const merged = useMemo<TranscriptTurn[]>(() => {
-    const startMs = startedRef.current;
-    type Segment = {
-      id: string;
-      text: string;
-      firstReceivedTime?: number;
-      final?: boolean;
-    };
-    const norm = (
-      role: "interviewer" | "candidate",
-      src: ReadonlyArray<Segment>,
-    ): TranscriptTurn[] =>
-      src.map((s) => ({
-        id: `${role}-${s.id}`,
-        role,
-        text: s.text,
-        t: Math.max(0, Math.floor(((s.firstReceivedTime ?? Date.now()) - startMs) / 1000)),
-        final: s.final ?? false,
-      }));
-    return [
-      ...norm("interviewer", agentSegments as ReadonlyArray<Segment>),
-      ...norm("candidate", userSegments as ReadonlyArray<Segment>),
-    ].sort((a, b) => a.t - b.t || (a.role === "interviewer" ? -1 : 1));
-  }, [agentSegments, userSegments]);
-
-  const lastInterviewerLine =
-    [...merged].reverse().find((tt) => tt.role === "interviewer")?.text ??
-    (agentState === "connecting" || agentState === "initializing"
-      ? "Connecting to interviewer…"
-      : "Listening…");
-
-  const questionIndex = Math.max(
-    1,
-    Math.min(4, merged.filter((tt) => tt.role === "interviewer" && tt.final).length || 1),
-  );
-
-  function endInterview() {
-    if (ending || showIngestion) return;
-    setShowIngestion(true);
-    startEnd(async () => {
-      try {
-        // Stop publishing audio + disconnect the room before scoring runs.
-        try {
-          await room.disconnect();
-        } catch {
-          /* ignore */
-        }
-        // Send the merged transcript as a fallback for the scoring route.
-        await Promise.all([
-          fetch("/api/interview/end-and-score", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              interview_id: interviewId,
-              transcript: merged.map((m) => ({ role: m.role, text: m.text, t: m.t })),
-            }),
-          }),
-          new Promise((r) => setTimeout(r, 4500)),
-        ]);
-        router.push(`/performance/${interviewId}`);
-      } catch {
-        toast.error("Could not finalize report");
-        setShowIngestion(false);
-      }
-    });
-  }
-
-  const mins = Math.floor(remainingMs / 60_000);
-  const secs = Math.floor((remainingMs % 60_000) / 1000);
-  const lowTime = remainingMs <= 30_000;
-  const isAgentSpeaking = agentState === "speaking";
-  const isAgentListening = agentState === "listening";
-  const orbScale = isAgentSpeaking ? 1 + Math.min(0.08, agentVolume * 0.25) : 1;
-
-  return (
-    <CallShell>
-      <CallTopBar
-        questionIndex={questionIndex}
-        mins={mins}
-        secs={secs}
-        lowTime={lowTime}
-      />
-
-      <div style={{ flex: 1, display: "grid", placeItems: "center", padding: 40, position: "relative" }}>
-        <Orb
-          isAgentSpeaking={isAgentSpeaking}
-          isAgentListening={isAgentListening}
-          agentVolume={agentVolume}
-          orbScale={orbScale}
-          agentState={agentState}
-          voice={voice}
-        />
-
-        <div
-          style={{
-            position: "absolute",
-            bottom: 140,
-            left: 0,
-            right: 0,
-            textAlign: "center",
-            padding: "0 80px",
-          }}
-        >
-          <motion.div
-            key={lastInterviewerLine}
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={tween(DUR.slow, EASE_OUT)}
-            className="serif"
-            style={{ fontSize: 32, lineHeight: 1.2, letterSpacing: "-0.02em", color: "#fff", fontWeight: 400 }}
-          >
-            “{lastInterviewerLine}”
-          </motion.div>
-        </div>
-      </div>
-
-      <CallBottomBar
-        localVolume={localVolume}
-        isAgentSpeaking={isAgentSpeaking}
-        isAgentListening={isAgentListening}
-        agentTimedOut={agentTimedOut}
-        ending={ending || showIngestion}
-        showTranscript={showTranscript}
-        onToggleTranscript={() => setShowTranscript((v) => !v)}
-        onEnd={endInterview}
-      />
-
-      {showTranscript && <FloatingTranscript turns={merged} voice={voice} />}
-
-      <AnimatePresence>{showIngestion && <IngestionOverlay />}</AnimatePresence>
-    </CallShell>
-  );
-}
-
-// ─── Scripted fallback (LiveKit not configured) ─────────────────────────
-function ScriptedFallback({
+// ─── ScriptedCall — Cartesia plays 4 questions, Deepgram transcribes ─────
+function ScriptedCall({
   job: _job,
   voice,
   interviewId,
@@ -495,7 +188,7 @@ function ScriptedFallback({
         if (cancelled) return;
         // Q4 is the last — after the answer window, end the interview rather
         // than queuing another question.
-        if (i + 1 >= FALLBACK_QUESTIONS.length) {
+        if (i + 1 >= QUESTIONS.length) {
           endInterview();
         } else {
           playQuestion(i + 1);
@@ -503,17 +196,17 @@ function ScriptedFallback({
       }, ms);
     }
     async function playQuestion(i: number) {
-      if (cancelled || i >= FALLBACK_QUESTIONS.length) return;
+      if (cancelled || i >= QUESTIONS.length) return;
       setAgentState("connecting");
       try {
         const res = await fetch("/api/tts", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ voice, text: FALLBACK_QUESTIONS[i] }),
+          body: JSON.stringify({ voice, text: QUESTIONS[i] }),
         });
         if (!res.ok) {
-          commitInterviewerTurn(FALLBACK_QUESTIONS[i]!, i);
-          const wait = i + 1 >= FALLBACK_QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
+          commitInterviewerTurn(QUESTIONS[i]!, i);
+          const wait = i + 1 >= QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
           scheduleNext(i, wait);
           return;
         }
@@ -540,31 +233,31 @@ function ScriptedFallback({
           };
           audio.addEventListener("play", () => {
             setAgentState("speaking");
-            commitInterviewerTurn(FALLBACK_QUESTIONS[i]!, i);
+            commitInterviewerTurn(QUESTIONS[i]!, i);
             tick();
           });
           audio.addEventListener("ended", () => {
             cancelAnimationFrame(raf);
             setAgentVolume(0);
             setAgentState("listening");
-            const wait = i + 1 >= FALLBACK_QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
+            const wait = i + 1 >= QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
             scheduleNext(i, wait);
           });
         } catch {
           audio.addEventListener("play", () => {
             setAgentState("speaking");
-            commitInterviewerTurn(FALLBACK_QUESTIONS[i]!, i);
+            commitInterviewerTurn(QUESTIONS[i]!, i);
           });
           audio.addEventListener("ended", () => {
             setAgentState("listening");
-            const wait = i + 1 >= FALLBACK_QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
+            const wait = i + 1 >= QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
             scheduleNext(i, wait);
           });
         }
         await audio.play();
       } catch {
-        commitInterviewerTurn(FALLBACK_QUESTIONS[i]!, i);
-        const wait = i + 1 >= FALLBACK_QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
+        commitInterviewerTurn(QUESTIONS[i]!, i);
+        const wait = i + 1 >= QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
         scheduleNext(i, wait);
       }
     }
@@ -624,7 +317,7 @@ function ScriptedFallback({
   const isAgentListening = agentState === "listening";
   const orbScale = isAgentSpeaking ? 1 + Math.min(0.08, agentVolume * 0.25) : 1;
   const lastInterviewerLine =
-    [...transcript].reverse().find((t) => t.role === "interviewer")?.text ?? FALLBACK_QUESTIONS[0]!;
+    [...transcript].reverse().find((t) => t.role === "interviewer")?.text ?? QUESTIONS[0]!;
 
   return (
     <CallShell>
@@ -660,7 +353,6 @@ function ScriptedFallback({
         localVolume={localVolume}
         isAgentSpeaking={isAgentSpeaking}
         isAgentListening={isAgentListening}
-        agentTimedOut={false}
         ending={ending || showIngestion}
         showTranscript={showTranscript}
         onToggleTranscript={() => setShowTranscript((v) => !v)}
@@ -781,7 +473,6 @@ function CallBottomBar({
   localVolume,
   isAgentSpeaking,
   isAgentListening,
-  agentTimedOut,
   ending,
   showTranscript,
   onToggleTranscript,
@@ -790,7 +481,6 @@ function CallBottomBar({
   localVolume: number;
   isAgentSpeaking: boolean;
   isAgentListening: boolean;
-  agentTimedOut: boolean;
   ending: boolean;
   showTranscript: boolean;
   onToggleTranscript: () => void;
@@ -829,13 +519,11 @@ function CallBottomBar({
           style={{ fontSize: 10.5, letterSpacing: "0.12em", textTransform: "uppercase", color: "#74706a" }}
         >
           Your mic ·{" "}
-          {agentTimedOut
-            ? "no agent — click stop"
-            : isAgentSpeaking
-              ? "muted while AI speaks"
-              : isAgentListening
-                ? "open"
-                : "standby"}
+          {isAgentSpeaking
+            ? "muted while AI speaks"
+            : isAgentListening
+              ? "open"
+              : "standby"}
         </span>
       </div>
       <button
@@ -1260,34 +948,3 @@ function IngestionOverlay() {
   );
 }
 
-// ─── useTrackVolume — sample audio analyser at 60fps ─────────────────────
-function useTrackVolume(track: TrackNS | null): number {
-  const [volume, setVolume] = useState(0);
-  useEffect(() => {
-    if (!track || !track.mediaStream) {
-      setVolume(0);
-      return;
-    }
-    const ctx = new AudioContext();
-    const source = ctx.createMediaStreamSource(track.mediaStream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 256;
-    source.connect(analyser);
-    const data = new Uint8Array(analyser.frequencyBinCount);
-    let raf = 0;
-    const tick = () => {
-      analyser.getByteFrequencyData(data);
-      let sum = 0;
-      for (let i = 0; i < data.length; i++) sum += data[i]! * data[i]!;
-      const rms = Math.sqrt(sum / data.length) / 255;
-      setVolume(rms);
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => {
-      cancelAnimationFrame(raf);
-      ctx.close();
-    };
-  }, [track]);
-  return volume;
-}
