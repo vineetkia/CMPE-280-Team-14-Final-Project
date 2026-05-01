@@ -94,7 +94,12 @@ export function useDeepgramTranscription({
           sample_rate: "16000",
         });
         const wsUrl = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
-        ws = new WebSocket(wsUrl, ["token", token]);
+        // Deepgram accepts two subprotocol forms: ["token", <project-key>] for
+        // raw API keys, or ["bearer", <jwt>] for short-lived access tokens
+        // minted via /v1/auth/grant. JWT tokens contain '.' which is not a
+        // valid subprotocol character, so the "token" form throws SyntaxError;
+        // "bearer" is the only path that works for temp tokens.
+        ws = new WebSocket(wsUrl, ["bearer", token]);
         ws.binaryType = "arraybuffer";
 
         ws.addEventListener("open", () => {
