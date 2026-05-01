@@ -37,13 +37,6 @@ const QUESTIONS = [
   "Last one: why are you looking for a new role right now?",
 ];
 
-// After the final question's audio ends, give the candidate this much time to
-// answer before the interview auto-ends and routes to the report.
-const FINAL_ANSWER_WINDOW_MS = 20_000;
-// During earlier questions, we also wait this long for the candidate to
-// answer before kicking off the next question. Slightly tighter than the
-// final-window so the interview doesn't drag.
-const ANSWER_WINDOW_MS = 14_000;
 
 interface TranscriptTurn {
   id: string;
@@ -68,6 +61,25 @@ export function LiveCall({
 }
 
 // ─── ScriptedCall — Cartesia plays 4 questions, Deepgram transcribes ─────
+// Short positive acknowledgements played between questions. One per turn, in
+// order, after the candidate finishes their answer.
+const ACKS = [
+  "Got it — thanks for that overview.",
+  "Helpful framing. Appreciate the context.",
+  "Solid — that's useful detail.",
+];
+// After the final answer is captured we play this wrap line, then end.
+const WRAP = "Thanks — that's all from me.";
+
+// How long to wait after the *last* Deepgram-final fragment before deciding
+// the candidate is done speaking (and we should ack + advance).
+const SILENCE_AFTER_ANSWER_MS = 1800;
+// Minimum word count in the cumulative answer before we consider it real.
+const MIN_ANSWER_WORDS = 3;
+// If the candidate stays silent this long after the question ends, treat the
+// turn as skipped and move on (so the interview can't stall forever).
+const NO_ANSWER_TIMEOUT_MS = 25_000;
+
 function ScriptedCall({
   job: _job,
   voice,
@@ -81,25 +93,45 @@ function ScriptedCall({
   const startedRef = useRef<number>(Date.now());
   const [remainingMs, setRemainingMs] = useState(DURATION_MS);
   const [questionIndex, setQuestionIndex] = useState(0);
-  const [agentState, setAgentState] = useState<"connecting" | "speaking" | "listening">("connecting");
+  const [agentState, setAgentState] = useState<"connecting" | "speaking" | "listening" | "thinking">("connecting");
   const [transcript, setTranscript] = useState<TranscriptTurn[]>([]);
-  // Live (interim) candidate fragment — re-rendered as Deepgram emits partials.
   const [liveCandidate, setLiveCandidate] = useState<string>("");
   const [showTranscript, setShowTranscript] = useState(true);
   const [localVolume, setLocalVolume] = useState(0);
   const [agentVolume, setAgentVolume] = useState(0);
   const [showIngestion, setShowIngestion] = useState(false);
   const [ending, startEnd] = useTransition();
+  // Strict no-fallback mode: if Deepgram fails to open we render a full-card
+  // error and don't proceed.
+  const [fatalError, setFatalError] = useState<string | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
   const endedRef = useRef(false);
-  // Tracks the index of the currently-active question so Deepgram finals can
-  // be attributed to the correct turn.
   const activeQuestionRef = useRef(-1);
+  // Mutable reference to the latest cumulative answer per question, used by
+  // the silence-detection effect that fires after each Deepgram final.
+  const answerBufferRef = useRef<Map<number, string>>(new Map());
+  // Timer that fires when the candidate has been silent long enough — pulled
+  // out so each new final can reset it.
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Continuation that the silence timer should call once silence is reached.
+  const onAnswerCompleteRef = useRef<(() => void) | null>(null);
+  // Hard cap on how long we wait per question before skipping.
+  const noAnswerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Mic-amplitude analyser for the bottom waveform. The Deepgram hook owns its
-  // own mic stream — using two getUserMedia calls is fine on Chrome.
+  function clearAnswerTimers() {
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
+    }
+    if (noAnswerTimerRef.current) {
+      clearTimeout(noAnswerTimerRef.current);
+      noAnswerTimerRef.current = null;
+    }
+  }
+
+  // Mic-amplitude analyser for the bottom waveform.
   useEffect(() => {
     let cancelled = false;
     let stream: MediaStream | null = null;
@@ -136,10 +168,10 @@ function ScriptedCall({
     };
   }, []);
 
-  // Stable callbacks for the Deepgram hook so renders don't recycle the WS.
   const handleFinal = useCallback((frag: TranscriptFragment) => {
     const t = Math.floor((Date.now() - startedRef.current) / 1000);
     const qIdx = activeQuestionRef.current;
+    if (qIdx < 0) return;
     setLiveCandidate("");
     setTranscript((prev) => [
       ...prev,
@@ -151,125 +183,188 @@ function ScriptedCall({
         final: true,
       },
     ]);
+    // Append to this question's running answer buffer.
+    const prev = answerBufferRef.current.get(qIdx) ?? "";
+    const next = prev ? `${prev} ${frag.text}` : frag.text;
+    answerBufferRef.current.set(qIdx, next);
+    // Reset the silence countdown — every new final restarts the clock.
+    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+    const wordCount = next.split(/\s+/).filter(Boolean).length;
+    if (wordCount >= MIN_ANSWER_WORDS) {
+      silenceTimerRef.current = setTimeout(() => {
+        const cb = onAnswerCompleteRef.current;
+        if (cb) {
+          onAnswerCompleteRef.current = null;
+          cb();
+        }
+      }, SILENCE_AFTER_ANSWER_MS);
+    }
   }, []);
   const handleInterim = useCallback((frag: TranscriptFragment) => {
     setLiveCandidate(frag.text);
   }, []);
 
-  // Open the Deepgram WS as soon as the fallback mounts. The hook handles its
-  // own getUserMedia and survives the entire interview.
   const dg = useDeepgramTranscription({
     enabled: true,
     onFinal: handleFinal,
     onInterim: handleInterim,
   });
-  // Surface a one-time toast if Deepgram errored — the demo still works
-  // without transcription.
-  useEffect(() => {
-    if (dg.error) {
-      toast.error(`Live transcription unavailable: ${dg.error}`);
-    }
-  }, [dg.error]);
 
+  // Strict failure mode: Deepgram error → fatalError card.
   useEffect(() => {
+    if (dg.error) setFatalError(dg.error);
+  }, [dg.error]);
+  // Also: if the WS hasn't opened within 6s, give up.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      if (!dg.isActive && !fatalError) {
+        setFatalError(
+          "Could not connect to the live transcription service in time. Refresh and try again.",
+        );
+      }
+    }, 6000);
+    return () => clearTimeout(t);
+  }, [dg.isActive, fatalError]);
+
+  // ─── Question loop ───────────────────────────────────────────────────
+  // Plays Cartesia clips synchronously and waits for the candidate's answer
+  // (Deepgram-final + silence) before advancing. Bails out cleanly on unmount.
+  useEffect(() => {
+    if (fatalError) return;
+    if (!dg.isActive) return; // wait until the transcription stream is open
+
     let cancelled = false;
-    function commitInterviewerTurn(text: string, i: number) {
+
+    function setActiveQuestion(i: number) {
+      activeQuestionRef.current = i;
+      setQuestionIndex(i + 1);
+    }
+
+    function commitInterviewerTurn(text: string, idForKey: string) {
       const t = Math.floor((Date.now() - startedRef.current) / 1000);
       setTranscript((prev) => {
-        if (prev.some((x) => x.id === `q-${i}`)) return prev;
-        return [...prev, { id: `q-${i}`, role: "interviewer", text, t, final: true }];
+        if (prev.some((x) => x.id === idForKey)) return prev;
+        return [...prev, { id: idForKey, role: "interviewer", text, t, final: true }];
       });
-      setQuestionIndex(i + 1);
-      activeQuestionRef.current = i;
     }
-    function scheduleNext(i: number, ms: number) {
-      if (cancelled) return;
-      setTimeout(() => {
-        if (cancelled) return;
-        // Q4 is the last — after the answer window, end the interview rather
-        // than queuing another question.
-        if (i + 1 >= QUESTIONS.length) {
-          endInterview();
-        } else {
-          playQuestion(i + 1);
-        }
-      }, ms);
-    }
-    async function playQuestion(i: number) {
-      if (cancelled || i >= QUESTIONS.length) return;
-      setAgentState("connecting");
-      try {
-        const res = await fetch("/api/tts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ voice, text: QUESTIONS[i] }),
-        });
-        if (!res.ok) {
-          commitInterviewerTurn(QUESTIONS[i]!, i);
-          const wait = i + 1 >= QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
-          scheduleNext(i, wait);
-          return;
-        }
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        const audio = new Audio(url);
-        audioRef.current = audio;
-        audio.addEventListener("ended", () => URL.revokeObjectURL(url));
+
+    // Play a Cartesia clip and resolve when the audio finishes (or fails).
+    function playClip(text: string, transcriptId: string): Promise<void> {
+      return new Promise(async (resolve) => {
+        if (cancelled) return resolve();
+        setAgentState("connecting");
         try {
-          const ctx = audioCtxRef.current ?? new AudioContext();
-          const src = ctx.createMediaElementSource(audio);
-          const analyser = ctx.createAnalyser();
-          analyser.fftSize = 256;
-          src.connect(analyser);
-          src.connect(ctx.destination);
-          const data = new Uint8Array(analyser.frequencyBinCount);
+          const res = await fetch("/api/tts", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ voice, text }),
+          });
+          if (!res.ok) {
+            commitInterviewerTurn(text, transcriptId);
+            return resolve();
+          }
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          const audio = new Audio(url);
+          audioRef.current = audio;
+          audio.addEventListener("ended", () => URL.revokeObjectURL(url));
           let raf = 0;
-          const tick = () => {
-            analyser.getByteFrequencyData(data);
-            let sum = 0;
-            for (let k = 0; k < data.length; k++) sum += data[k]! * data[k]!;
-            setAgentVolume(Math.sqrt(sum / data.length) / 255);
-            if (!audio.paused && !audio.ended) raf = requestAnimationFrame(tick);
-          };
-          audio.addEventListener("play", () => {
-            setAgentState("speaking");
-            commitInterviewerTurn(QUESTIONS[i]!, i);
-            tick();
-          });
-          audio.addEventListener("ended", () => {
-            cancelAnimationFrame(raf);
-            setAgentVolume(0);
-            setAgentState("listening");
-            const wait = i + 1 >= QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
-            scheduleNext(i, wait);
-          });
+          try {
+            const ctx = audioCtxRef.current ?? new AudioContext();
+            const src = ctx.createMediaElementSource(audio);
+            const analyser = ctx.createAnalyser();
+            analyser.fftSize = 256;
+            src.connect(analyser);
+            src.connect(ctx.destination);
+            const data = new Uint8Array(analyser.frequencyBinCount);
+            const tick = () => {
+              analyser.getByteFrequencyData(data);
+              let sum = 0;
+              for (let k = 0; k < data.length; k++) sum += data[k]! * data[k]!;
+              setAgentVolume(Math.sqrt(sum / data.length) / 255);
+              if (!audio.paused && !audio.ended) raf = requestAnimationFrame(tick);
+            };
+            audio.addEventListener("play", () => {
+              setAgentState("speaking");
+              commitInterviewerTurn(text, transcriptId);
+              tick();
+            });
+            audio.addEventListener("ended", () => {
+              cancelAnimationFrame(raf);
+              setAgentVolume(0);
+              resolve();
+            });
+            audio.addEventListener("error", () => {
+              cancelAnimationFrame(raf);
+              setAgentVolume(0);
+              resolve();
+            });
+          } catch {
+            // MediaElementSource not supported — still play the audio
+            audio.addEventListener("play", () => {
+              setAgentState("speaking");
+              commitInterviewerTurn(text, transcriptId);
+            });
+            audio.addEventListener("ended", () => resolve());
+            audio.addEventListener("error", () => resolve());
+          }
+          await audio.play();
         } catch {
-          audio.addEventListener("play", () => {
-            setAgentState("speaking");
-            commitInterviewerTurn(QUESTIONS[i]!, i);
-          });
-          audio.addEventListener("ended", () => {
-            setAgentState("listening");
-            const wait = i + 1 >= QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
-            scheduleNext(i, wait);
-          });
+          commitInterviewerTurn(text, transcriptId);
+          resolve();
         }
-        await audio.play();
-      } catch {
-        commitInterviewerTurn(QUESTIONS[i]!, i);
-        const wait = i + 1 >= QUESTIONS.length ? FINAL_ANSWER_WINDOW_MS : ANSWER_WINDOW_MS;
-        scheduleNext(i, wait);
-      }
+      });
     }
-    const kickoff = setTimeout(() => playQuestion(0), 600);
+
+    // Wait for the candidate to finish answering — resolves either when the
+    // silence timer fires or after NO_ANSWER_TIMEOUT_MS (whichever first).
+    function waitForAnswer(): Promise<void> {
+      return new Promise((resolve) => {
+        let resolved = false;
+        const finish = () => {
+          if (resolved) return;
+          resolved = true;
+          clearAnswerTimers();
+          resolve();
+        };
+        onAnswerCompleteRef.current = finish;
+        noAnswerTimerRef.current = setTimeout(finish, NO_ANSWER_TIMEOUT_MS);
+      });
+    }
+
+    (async () => {
+      // Brief settle so the orb mount animation finishes.
+      await new Promise((r) => setTimeout(r, 600));
+      for (let i = 0; i < QUESTIONS.length; i++) {
+        if (cancelled || endedRef.current) return;
+        setActiveQuestion(i);
+        await playClip(QUESTIONS[i]!, `q-${i}`);
+        if (cancelled || endedRef.current) return;
+        setAgentState("listening");
+        await waitForAnswer();
+        if (cancelled || endedRef.current) return;
+        // Acks for Q1..Q3, wrap-up for Q4.
+        const isLast = i + 1 >= QUESTIONS.length;
+        const ackText = isLast ? WRAP : ACKS[i] ?? "Thanks for that.";
+        setAgentState("thinking");
+        await new Promise((r) => setTimeout(r, 350));
+        await playClip(ackText, `ack-${i}`);
+      }
+      // All done — auto-end.
+      endInterview();
+    })();
+
     return () => {
       cancelled = true;
-      clearTimeout(kickoff);
+      clearAnswerTimers();
+      onAnswerCompleteRef.current = null;
       audioRef.current?.pause();
       audioRef.current = null;
     };
-  }, [voice]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [voice, dg.isActive, fatalError]);
 
+  // 2-minute hard cap.
   useEffect(() => {
     const t = setInterval(() => {
       const left = Math.max(0, DURATION_MS - (Date.now() - startedRef.current));
@@ -286,6 +381,7 @@ function ScriptedCall({
   function endInterview() {
     if (endedRef.current || ending || showIngestion) return;
     endedRef.current = true;
+    clearAnswerTimers();
     setShowIngestion(true);
     audioRef.current?.pause();
     startEnd(async () => {
@@ -310,6 +406,60 @@ function ScriptedCall({
     });
   }
 
+  // Strict failure card — no fallbacks.
+  if (fatalError) {
+    return (
+      <CallShell>
+        <div
+          style={{
+            margin: "auto",
+            maxWidth: 520,
+            padding: 32,
+            border: "1px solid #d97a4a40",
+            background: "#1c1a1488",
+            backdropFilter: "blur(20px)",
+            borderRadius: 14,
+            textAlign: "center",
+          }}
+        >
+          <Eyebrow style={{ color: "#d97a4a" }}>Interview unavailable</Eyebrow>
+          <p
+            className="serif"
+            style={{
+              marginTop: 18,
+              fontSize: 24,
+              lineHeight: 1.3,
+              letterSpacing: "-0.01em",
+              color: "#ece7dc",
+            }}
+          >
+            Live transcription failed to start.
+          </p>
+          <p style={{ marginTop: 14, fontSize: 14, color: "#a8a397", lineHeight: 1.5 }}>
+            {fatalError}
+          </p>
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            style={{
+              marginTop: 26,
+              padding: "10px 22px",
+              border: "1px solid #ece7dc44",
+              background: "transparent",
+              color: "#ece7dc",
+              fontSize: 13,
+              letterSpacing: "0.04em",
+              cursor: "pointer",
+              borderRadius: 4,
+            }}
+          >
+            Reload and try again
+          </button>
+        </div>
+      </CallShell>
+    );
+  }
+
   const mins = Math.floor(remainingMs / 60_000);
   const secs = Math.floor((remainingMs % 60_000) / 1000);
   const lowTime = remainingMs <= 30_000;
@@ -327,7 +477,41 @@ function ScriptedCall({
         secs={secs}
         lowTime={lowTime}
       />
-      <div style={{ flex: 1, display: "grid", placeItems: "center", padding: 40, position: "relative" }}>
+      {/* Agent subtitle sits in the upper third of the canvas, well above the
+          orb's status label so the two never collide. */}
+      <div
+        style={{
+          position: "absolute",
+          top: 110,
+          left: 0,
+          right: 0,
+          textAlign: "center",
+          padding: "0 96px",
+          pointerEvents: "none",
+        }}
+      >
+        <motion.div
+          key={lastInterviewerLine}
+          initial={{ opacity: 0, y: 6 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={tween(DUR.slow, EASE_OUT)}
+          className="serif"
+          style={{
+            fontSize: 28,
+            lineHeight: 1.25,
+            letterSpacing: "-0.02em",
+            color: "#fff",
+            fontWeight: 400,
+            maxWidth: 980,
+            margin: "0 auto",
+          }}
+        >
+          “{lastInterviewerLine}”
+        </motion.div>
+      </div>
+      <div
+        style={{ flex: 1, display: "grid", placeItems: "center", padding: 40, position: "relative" }}
+      >
         <Orb
           isAgentSpeaking={isAgentSpeaking}
           isAgentListening={isAgentListening}
@@ -336,18 +520,6 @@ function ScriptedCall({
           agentState={agentState}
           voice={voice}
         />
-        <div style={{ position: "absolute", bottom: 140, left: 0, right: 0, textAlign: "center", padding: "0 80px" }}>
-          <motion.div
-            key={lastInterviewerLine}
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={tween(DUR.slow, EASE_OUT)}
-            className="serif"
-            style={{ fontSize: 32, lineHeight: 1.2, letterSpacing: "-0.02em", color: "#fff", fontWeight: 400 }}
-          >
-            “{lastInterviewerLine}”
-          </motion.div>
-        </div>
       </div>
       <CallBottomBar
         localVolume={localVolume}
