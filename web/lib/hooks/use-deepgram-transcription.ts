@@ -26,12 +26,18 @@ export interface UseDeepgramTranscriptionOptions {
   // be memoized — the hook only reads the latest ref.
   onFinal?: (fragment: TranscriptFragment) => void;
   onInterim?: (fragment: TranscriptFragment) => void;
+  // Fired when Deepgram emits an `UtteranceEnd` event — i.e., the user has
+  // genuinely stopped speaking (per Deepgram's VAD). More reliable than
+  // counting silence between finals because it accounts for in-utterance
+  // pauses.
+  onUtteranceEnd?: () => void;
 }
 
 export function useDeepgramTranscription({
   enabled,
   onFinal,
   onInterim,
+  onUtteranceEnd,
 }: UseDeepgramTranscriptionOptions) {
   const [isActive, setIsActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -39,6 +45,10 @@ export function useDeepgramTranscription({
   // Keep callback refs so changes don't restart the WS.
   const onFinalRef = useRef(onFinal);
   const onInterimRef = useRef(onInterim);
+  const onUtteranceEndRef = useRef(onUtteranceEnd);
+  useEffect(() => {
+    onUtteranceEndRef.current = onUtteranceEnd;
+  }, [onUtteranceEnd]);
   useEffect(() => {
     onFinalRef.current = onFinal;
     onInterimRef.current = onInterim;
@@ -83,13 +93,20 @@ export function useDeepgramTranscription({
 
         // Connect to Deepgram. Nova-3 + interim_results gives word-by-word
         // partials and finalized phrases. smart_format: true cleans punctuation.
+        // endpointing=800ms: how long Deepgram waits before declaring a phrase
+        //   final. Higher = more tolerant of mid-sentence thinking pauses.
+        // utterance_end_ms=1500: how long Deepgram waits *after* the last
+        //   speech before sending an UtteranceEnd event. This is what we use
+        //   to know the candidate truly stopped, not just paused.
         const params = new URLSearchParams({
           model: "nova-3",
           language: "en-US",
           punctuate: "true",
           smart_format: "true",
           interim_results: "true",
-          endpointing: "300",
+          endpointing: "800",
+          utterance_end_ms: "1500",
+          vad_events: "true",
           encoding: "linear16",
           sample_rate: "16000",
         });
@@ -153,6 +170,12 @@ export function useDeepgramTranscription({
         ws.addEventListener("message", (ev) => {
           try {
             const data = JSON.parse(ev.data as string);
+            // Deepgram emits separate event types: Results (transcript chunks),
+            // UtteranceEnd (VAD says the speaker stopped), SpeechStarted, etc.
+            if (data.type === "UtteranceEnd") {
+              onUtteranceEndRef.current?.();
+              return;
+            }
             if (data.type !== "Results") return;
             const alt = data.channel?.alternatives?.[0];
             const text: string = alt?.transcript ?? "";
